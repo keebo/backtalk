@@ -47,6 +47,17 @@ from backtalk import signals
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
 
+def _msg_tag(msg) -> str:
+    """Short label for a raw SDK message, for the off-by-one desync
+    investigation (2026-08-29): type name, plus the subtype for a
+    SystemMessage since that's where a task_notification would surface —
+    the suspected but unconfirmed trigger for a query landing paired
+    with the wrong response."""
+    t = type(msg).__name__
+    sub = getattr(msg, "subtype", None)
+    return f"{t}:{sub}" if sub else t
+
+
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 
 
@@ -247,17 +258,18 @@ class WarmBrain:
         except Exception:
             pass  # turn may already be over — the drain below is the point
 
-        async def _drain() -> int:
-            n = 0
+        async def _drain() -> list[str]:
+            tags = []
             async for msg in self._client.receive_response():
-                n += 1
+                tags.append(_msg_tag(msg))
                 if type(msg).__name__ == "ResultMessage":
                     break
-            return n
+            return tags
 
         try:
             drained = await asyncio.wait_for(_drain(), timeout)
-            log(f"[brain] interrupted turn drained ({drained} stale messages)")
+            log(f"[brain] interrupted turn drained ({len(drained)} stale "
+                f"messages): {drained}")
             self._dirty = False
         except Exception:
             # Can't re-align — rebuild the session rather than run
@@ -301,11 +313,23 @@ class WarmBrain:
         client immediately and surfaces as BrainDisconnected so the caller
         can say so out loud instead of quietly going stale."""
         self._dirty = True             # in flight until its ResultMessage
+        tag = utterance[:40].replace("\n", " ")
         try:
             await self._client.query(utterance)
+            log(f"[brain] >> {tag!r}")
             buf = ""
             async for msg in self._client.receive_response():
                 t = type(msg).__name__
+                # Off-by-one desync investigation (2026-08-29): log every
+                # message type this stream hands back, tagged with the
+                # utterance it's paired with — StreamEvent/ResultMessage
+                # are the only types this loop otherwise understands, so
+                # anything else (a task_notification SystemMessage is the
+                # suspected culprit) has silently fallen through unlogged
+                # until now. If one ever surfaces attached to the WRONG
+                # utterance's stream, that's the smoking gun.
+                if t not in ("StreamEvent", "ResultMessage"):
+                    log(f"[brain] .. {tag!r} recv {_msg_tag(msg)}")
                 if t == "StreamEvent":
                     ev = getattr(msg, "event", {}) or {}
                     if ev.get("type") == "content_block_start":
@@ -349,6 +373,7 @@ class WarmBrain:
                     self._dirty = False    # turn fully consumed — pipe aligned
                     self._tally(msg)
                     self._remember_session(msg)
+                    log(f"[brain] << {tag!r} ResultMessage")
                     break
             tail = buf.strip()
             if tail:
