@@ -62,7 +62,7 @@ import threading
 import time
 
 from backtalk import signals
-from backtalk.brain import WarmBrain
+from backtalk.brain import BrainDisconnected, WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
@@ -627,6 +627,15 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         except Exception:
             pass
         raise
+    except BrainDisconnected:
+        # The connection died mid-turn and brain.py already rebuilt it
+        # (see BrainDisconnected's docstring). Say so instead of going
+        # silently stale — this used to be the failure that needed a
+        # full app restart to clear.
+        signals.static_stop()
+        signals.set_state("idle")
+        mouth.say("I lost my connection there for a second — reconnected, "
+                   "go ahead and ask again.")
 
 
 async def amain():
