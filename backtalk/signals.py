@@ -20,9 +20,14 @@
 The voice line leaves notes; faces read the notes. That one dumb trick
 is the whole integration surface:
 
-  .voice_state        idle | listening | thinking | speaking
+  .voice_state        idle | listening | thinking | working | speaking
   .voice_waveform     JSON {ts, samples: [64 floats]} while audio plays
   .voice_loading_pid  exists while the thinking sound is playing
+
+"working" is distinct from "thinking": thinking is the model composing
+a reply with nothing to show yet; working is a tool call actually
+running (a file write, a shell command, a dispatched subagent) — set
+from brain.ask_stream the moment a tool_use content block starts.
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.

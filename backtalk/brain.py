@@ -42,6 +42,7 @@ except ImportError:                       # older SDKs: nothing to silence
 
 from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
+from backtalk import signals
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
@@ -81,6 +82,13 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+
+    @property
+    def turn_active(self) -> bool:
+        """True from the moment a turn is sent until its ResultMessage
+        lands. The mouth reads this before declaring idle, so a turn
+        that goes quiet mid-tool-call doesn't read as nothing happening."""
+        return self._dirty
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -300,7 +308,20 @@ class WarmBrain:
                 t = type(msg).__name__
                 if t == "StreamEvent":
                     ev = getattr(msg, "event", {}) or {}
-                    if ev.get("type") == "content_block_delta":
+                    if ev.get("type") == "content_block_start":
+                        # Tool calls carry no text delta, so without this
+                        # the face reads "idle" the whole time a background
+                        # task (Bash, a file write, a dispatched subagent)
+                        # is actually running. A text block starting again
+                        # means the model resumed composing after a tool
+                        # result came back.
+                        cbt = (ev.get("content_block") or {}).get("type")
+                        if cbt in ("tool_use", "server_tool_use"):
+                            signals.set_state("working")
+                            signals.static_start()
+                        elif cbt == "text":
+                            signals.set_state("thinking")
+                    elif ev.get("type") == "content_block_delta":
                         delta = ev.get("delta", {}) or {}
                         if delta.get("type") == "text_delta":
                             buf += delta.get("text", "")

@@ -273,7 +273,7 @@ def make_permission_gate(mouth):
                 interrupt=False)
         approved = _norm_speech(answer) in _YES
         # the model keeps working either way: restore the working state
-        signals.set_state("thinking")
+        signals.set_state("working")
         signals.static_start()
         if approved:
             log("[perm]   approved by voice")
@@ -616,10 +616,14 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         if batch:
             mouth.say_chunk(" ".join(batch), pending)
             pending = []
-        if first:
-            # Zero sentences yielded (brain error / empty turn): nothing
-            # will ever dequeue, so nothing resets the bus — park it here.
-            signals.static_stop()
+        # ask_stream only returns after its ResultMessage, so the SDK-side
+        # turn is fully over here. If nothing is left queued or playing —
+        # whether because zero sentences were ever spoken, or because the
+        # very last thing that happened was a silent tool call — nothing
+        # else is coming to reset the bus, so settle it now. Otherwise the
+        # mouth's own worker will settle it once playback actually drains.
+        signals.static_stop()
+        if mouth.nothing_queued():
             signals.set_state("idle")
     except asyncio.CancelledError:
         try:
@@ -667,6 +671,7 @@ async def amain():
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth),
                       resume_id=resume_id)
+    mouth._turn_active = lambda: brain.turn_active
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
@@ -907,7 +912,6 @@ async def amain():
             log("[turn] interrupted mid-reply by new input")
             _deny_pending()          # an ask never outlives its turn
             speak_task.cancel()
-            mouth.shut_up()
         if speak_task:
             # Let the cancellation fully land (its brain.interrupt()
             # included) BEFORE anything else touches the brain —
@@ -921,6 +925,15 @@ async def amain():
             except Exception:
                 pass
             speak_task = None
+        # Unconditional, not gated on speak_task.done(): text generation
+        # always finishes long before its audio finishes playing, so by
+        # the time new input arrives the previous task is almost always
+        # already "done" even though mouth._q still has its unplayed
+        # sentences queued. Gating this on task-completion was the actual
+        # cause of the backlog — a finished task can still leave stale
+        # audio behind for the new reply to pile up behind instead of
+        # replacing. Always flush here regardless of task state.
+        mouth.shut_up()
         verb = verb or console_match(text)
         if verb:
             await run_console(verb)

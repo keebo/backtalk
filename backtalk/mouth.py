@@ -268,10 +268,20 @@ class Mouth:
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
+        # Late-bound (main.py sets this once the brain exists): tells the
+        # worker whether a turn is still in flight, so draining the local
+        # speech queue mid-turn doesn't get mistaken for the reply being over.
+        self._turn_active = None
 
     @property
     def speaking(self) -> bool:
         return self._speaking.is_set()
+
+    def nothing_queued(self) -> bool:
+        """Nothing left to play right now. Used at turn-end to settle the
+        face when a tool call was the very last thing (no trailing text
+        ever arrived to trigger the worker's own idle check)."""
+        return self._q.empty() and not self._speaking.is_set()
 
     def say(self, text: str):
         """Queue text (split to sentences) for speech."""
@@ -337,7 +347,13 @@ class Mouth:
                     # the gap between two sentences of the same reply.
                     signals.reply_done()
                     self.ducker.speech_end()
-                    signals.set_state("idle")
+                    # Only declare idle if the brain agrees the turn is
+                    # actually over. Mid-turn (a tool call about to run,
+                    # or more text still coming) this queue drains too —
+                    # leave the state as brain.ask_stream last set it
+                    # rather than flashing idle and back.
+                    if self._turn_active is None or not self._turn_active():
+                        signals.set_state("idle")
 
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened only when the
