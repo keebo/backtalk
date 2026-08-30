@@ -41,7 +41,7 @@ except ImportError:                       # older SDKs: nothing to silence
     CanUseToolShadowedWarning = None
 
 from backtalk.config import CFG, DISCIPLINE
-from backtalk.vlog import log
+from backtalk.vlog import log, log_debug
 from backtalk import signals
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
@@ -237,7 +237,8 @@ class WarmBrain:
             await self._client.interrupt()
 
     async def reset_turn(self, timeout: float = 8.0):
-        """Re-align the message pipe after an interrupted/failed turn.
+        """Re-align the message pipe before every turn — not just after
+        a KNOWN interrupted/failed one.
 
         THE OFF-BY-ONE BUG, and why this method exists: the SDK client
         has ONE shared message stream and receive_response() stops at
@@ -249,14 +250,28 @@ class WarmBrain:
         ResultMessage and yields nothing, and every ask after that
         answers the PREVIOUS question — for the rest of the session.
         So: interrupt the dead turn, then drain the pipe through its
-        stale ResultMessage before the next query goes out. No-op when
-        the last turn was consumed clean."""
-        if not self._client or not self._dirty:
+        stale ResultMessage before the next query goes out.
+
+        Confirmed 2026-08-29: a background task_notification landing
+        mid-turn (any Bash/tool background job completing) can make
+        receive_response() stop on ITS boundary marker instead of the
+        real turn's ResultMessage, clearing self._dirty as if the turn
+        ended clean when it didn't. That means self._dirty can lie, so
+        gating this whole method on it (the old behavior) let exactly
+        that case slip past the only repair mechanism, silently, for
+        the rest of the session. Now this always attempts a drain: a
+        short speculative one when self._dirty already says clean (catches
+        anything orphaned behind that lie, at near-zero cost since
+        there's normally nothing sitting there to find), the full
+        timeout when self._dirty confirms a real turn needs re-aligning."""
+        if not self._client:
             return
-        try:
-            await asyncio.wait_for(self._client.interrupt(), 5)
-        except Exception:
-            pass  # turn may already be over — the drain below is the point
+        known_dirty = self._dirty
+        if known_dirty:
+            try:
+                await asyncio.wait_for(self._client.interrupt(), 5)
+            except Exception:
+                pass  # turn may already be over — the drain below is the point
 
         async def _drain() -> list[str]:
             tags = []
@@ -266,12 +281,24 @@ class WarmBrain:
                     break
             return tags
 
+        drain_timeout = timeout if known_dirty else 0.2
         try:
-            drained = await asyncio.wait_for(_drain(), timeout)
-            log(f"[brain] interrupted turn drained ({len(drained)} stale "
-                f"messages): {drained}")
+            drained = await asyncio.wait_for(_drain(), drain_timeout)
+            if drained:
+                log(f"[brain] interrupted turn drained ({len(drained)} stale messages)")
+                log_debug(f"[brain] drained tags: {drained}")
             self._dirty = False
+        except asyncio.TimeoutError:
+            if not known_dirty:
+                # Speculative peek found nothing in the pipe within budget —
+                # the expected, common case. Not an error, nothing to rebuild.
+                return
+            log("[brain] stream desynced beyond repair — rebuilding the "
+                "session (conversation memory for this session resets)")
+            await self._rebuild_client()
         except Exception:
+            if not known_dirty:
+                return
             # Can't re-align — rebuild the session rather than run
             # desynced. Loses this voice session's conversation memory;
             # better than answering every question one turn late for the
@@ -316,7 +343,7 @@ class WarmBrain:
         tag = utterance[:40].replace("\n", " ")
         try:
             await self._client.query(utterance)
-            log(f"[brain] >> {tag!r}")
+            log_debug(f"[brain] >> {tag!r}")
             buf = ""
             async for msg in self._client.receive_response():
                 t = type(msg).__name__
@@ -329,7 +356,7 @@ class WarmBrain:
                 # until now. If one ever surfaces attached to the WRONG
                 # utterance's stream, that's the smoking gun.
                 if t not in ("StreamEvent", "ResultMessage"):
-                    log(f"[brain] .. {tag!r} recv {_msg_tag(msg)}")
+                    log_debug(f"[brain] .. {tag!r} recv {_msg_tag(msg)}")
                 if t == "StreamEvent":
                     ev = getattr(msg, "event", {}) or {}
                     if ev.get("type") == "content_block_start":
@@ -373,7 +400,7 @@ class WarmBrain:
                     self._dirty = False    # turn fully consumed — pipe aligned
                     self._tally(msg)
                     self._remember_session(msg)
-                    log(f"[brain] << {tag!r} ResultMessage")
+                    log_debug(f"[brain] << {tag!r} ResultMessage")
                     break
             tail = buf.strip()
             if tail:

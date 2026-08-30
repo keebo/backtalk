@@ -67,6 +67,20 @@ def log(line: str):
     except UnicodeEncodeError:
         # Last resort if the console refused UTF-8: readable beats fatal.
         print(line.encode("ascii", "replace").decode("ascii"), flush=True)
+    _append(line)
+
+
+def log_debug(line: str):
+    """Same receipts as log(), minus the terminal print.
+
+    For diagnostic instrumentation (like the off-by-one desync
+    investigation) that's too noisy to sit in the live transcript but
+    still needs to land in backtalk.log for after-the-fact digging.
+    """
+    _append(line)
+
+
+def _append(line: str):
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         # encoding pinned on purpose. The default is the platform's, which
