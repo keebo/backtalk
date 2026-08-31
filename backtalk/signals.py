@@ -25,6 +25,9 @@ is the whole integration surface:
   .voice_loading_pid  exists while the thinking sound is playing
   .voice_rate_limits  JSON {window: {utilization, resets_at}} — only
                       written when show_usage is on
+  .voice_source       cloud | local — which model answered the turn
+                      currently in flight; only written when
+                      local_llm.enabled is on
 
 "working" is distinct from "thinking": thinking is the model composing
 a reply with nothing to show yet; working is a tool call actually
@@ -58,6 +61,7 @@ _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
 _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
+_SOURCE_FILE = os.path.join(_DIR, ".voice_source")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -111,6 +115,19 @@ def feed_waveform(pcm: np.ndarray):
     except (OSError, ValueError):
         pass
     set_state("speaking")
+
+
+def set_source(name: str):
+    """Which model is answering the turn now starting: "local" or
+    "cloud". Written right as a turn begins (thinking state), ahead of
+    the voice difference actually being audible, so the face can flag
+    it immediately rather than waiting for speech to start. Never
+    raises."""
+    try:
+        with open(_SOURCE_FILE, "w") as f:
+            f.write(name)
+    except OSError:
+        pass
 
 
 def direction(items):

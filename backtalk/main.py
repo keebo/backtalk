@@ -61,7 +61,23 @@ import sys
 import threading
 import time
 
-from backtalk import signals
+# Eager, synchronous, main-thread-only — before anything spawns a
+# worker thread. Kokoro (via mouth's own worker thread) and mlx-lm
+# (via local_llm.warm's executor thread) both trigger transformers'
+# lazy-submodule loading on first touch, and doing that from two
+# threads at once is a real, reproduced race: transformers' internal
+# lazy-import machinery isn't thread-safe on its OWN first call,
+# throwing a spurious "cannot import name 'AlbertModel' from
+# 'transformers'" — confirmed 3/3 reproductions when kokoro, mlx_lm,
+# and mlx_whisper import concurrently, 0/5 with this line first, 0/5
+# even in the original two-way (kokoro + ears) case. This one import
+# forces transformers to finish its lazy setup here, in the main
+# thread, before mouth's worker thread or any run_in_executor warmup
+# call can touch it — every later "import" from another thread is then
+# just a fast, safe sys.modules cache hit instead of a fresh init race.
+import transformers  # noqa: F401
+
+from backtalk import router, signals
 from backtalk.brain import BrainDisconnected, WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
@@ -83,6 +99,17 @@ PERM_TIMEOUT_S = 75
 _PERM = {"fut": None, "asked_at": 0.0,   # pending ask + when it was posed
          "hinted": False}                # escape-hatch hint said yet?
 _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
+# The router has no memory of the conversation, so a short reply to a
+# question CIPHER (either path) just asked ("yes", "no, I did") often
+# carries no keyword the router can catch — and the local model, with
+# zero context, answers it as a generic non-sequitur. Confirmed live,
+# repeatedly: Kevin's plain "yes" to a direct question, and his
+# correction "no, I did get the greeting correctly," both misrouted
+# local. Fix: whenever a reply (either path) ends in "?", the very
+# next utterance is forced to cloud regardless of what the router
+# would have picked — a real answer needs the memory that posed the
+# question in the first place.
+_ROUTER_STATE = {"awaiting_answer": False}
 _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
 # Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
 # a live switch INTO bypassPermissions unless it was launched with the
@@ -570,14 +597,88 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
+async def speak_reply_local(mouth: Mouth, text: str) -> bool:
+    """Answers entirely with the local model — no Claude turn at all,
+    so zero tokens spent. Returns True once spoken; False if local
+    generation failed, telling the caller to fall back to the normal
+    cloud path rather than going silent (degrade, never mute — same
+    rule mouth.py's ElevenLabs->Kokoro fallback follows).
+
+    KNOWN LIMITATION: a barge-in cancels the awaiting task, but MLX
+    generation itself has no cancellation hook, so a stray generation
+    can keep running in its executor thread for a second or two after
+    a cut — harmless (nothing is spoken from it, no side effects), just
+    not instantly reclaimed."""
+    from backtalk import local_llm
+
+    signals.set_source("local")
+    signals.set_state("thinking")
+    signals.static_start()
+    t0 = time.time()
+    loop = asyncio.get_event_loop()
+    try:
+        reply = await loop.run_in_executor(None, local_llm.generate, text)
+    except Exception as e:
+        log(f"[local] generation failed ({e}) — falling back to cloud")
+        return False
+    if not reply:
+        log("[local] empty reply — falling back to cloud")
+        return False
+    local_name = CFG.get("local_llm", {}).get("name") or "local"
+    log(f"[{local_name}] ({time.time() - t0:.1f}s) {reply}")
+    _ROUTER_STATE["awaiting_answer"] = reply.rstrip().endswith("?")
+    mouth.say(reply, voice=CFG.get("local_llm", {}).get("voice") or None)
+    signals.static_stop()
+    if mouth.nothing_queued():
+        signals.set_state("idle")
+    return True
+
+
 async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    short sentences come out flat).
+
+    Routes self-contained questions to the local model first when
+    local_llm.enabled — see router.py for the local-vs-cloud call and
+    speak_reply_local for that path. "Ask Cipher directly" (or a few
+    close variants) forces cloud regardless of what the router would
+    have picked."""
+    local_on = CFG.get("local_llm", {}).get("enabled")
+    if local_on:
+        local_text, forced_local = router.strip_force_local(text)
+        if forced_local:
+            # Addressing her by name ("Rosa, ...") is the most explicit
+            # signal there is — it wins even over a pending
+            # awaiting_answer flag, unlike the keyword router below.
+            _ROUTER_STATE["awaiting_answer"] = False
+            if await speak_reply_local(mouth, local_text):
+                return
+            # Local generation itself failed — fall through to the
+            # normal cloud path below instead of going silent.
+            signals.set_source("cloud")
+        elif _ROUTER_STATE["awaiting_answer"]:
+            # This utterance is very likely answering a question CIPHER
+            # just asked (either path) — the router has no conversation
+            # memory to catch that on keywords alone, so skip it
+            # outright rather than risk the local model getting a
+            # context-free non-sequitur.
+            _ROUTER_STATE["awaiting_answer"] = False
+            signals.set_source("cloud")
+        else:
+            text, forced = router.strip_force_cloud(text)
+            if not forced and router.route(text) == "local":
+                if await speak_reply_local(mouth, text):
+                    return
+                # Local generation itself failed — fall through to the
+                # normal cloud path below instead of going silent.
+            signals.set_source("cloud")
+
     t0 = time.time()
     first = True
     batch: list[str] = []
     pending: list[str] = []          # directions waiting for their chunk
+    full_reply: list[str] = []       # accumulated for the question-ending check below
 
     def emit(raw: str):
         nonlocal first, batch, pending
@@ -596,6 +697,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         s = " ".join(raw.replace("`", "").split()).strip()
         if not s:
             return
+        full_reply.append(s)
         if first:
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
@@ -623,6 +725,9 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         # else is coming to reset the bus, so settle it now. Otherwise the
         # mouth's own worker will settle it once playback actually drains.
         signals.static_stop()
+        if local_on:
+            _ROUTER_STATE["awaiting_answer"] = (
+                bool(full_reply) and full_reply[-1].endswith("?"))
         if mouth.nothing_queued():
             signals.set_state("idle")
     except asyncio.CancelledError:
@@ -685,6 +790,11 @@ async def amain():
     # Warm the engines while the greeting plays: the STT model load and
     # the brain's prompt-cache toll both hide behind the spoken line.
     loop.run_in_executor(None, warm_ears)
+    if CFG.get("local_llm", {}).get("enabled"):
+        # Same idea: the ~3s MLX load hides behind the greeting instead
+        # of stalling the first local-routed question of the session.
+        from backtalk import local_llm
+        loop.run_in_executor(None, local_llm.warm)
     # THE BRAIN CONNECT, guarded. This is the one startup step that
     # needs a signed-in Claude Code, internet, and available usage.
     # When it fails or hangs, the mouth still works, so SAY SO instead

@@ -224,14 +224,16 @@ def split_sentences(text: str) -> list[str]:
     return parts or ([text.strip()] if text.strip() else [])
 
 
-def _stream_kokoro(text: str):
-    """One sentence -> int16 PCM chunks at 24kHz, in-process."""
+def _stream_kokoro(text: str, voice: str | None = None):
+    """One sentence -> int16 PCM chunks at 24kHz, in-process. `voice`
+    overrides CFG["voice"] for this call only — used to give the local
+    LLM's replies an audibly different voice from Cipher's own."""
     pipe = warm()
     try:
         speed = float(CFG.get("speed") or 1.0)
     except (TypeError, ValueError):
         speed = 1.0
-    for _, _, audio in pipe(text, voice=CFG["voice"], speed=speed):
+    for _, _, audio in pipe(text, voice=voice or CFG["voice"], speed=speed):
         a = np.asarray(audio, dtype=np.float32)
         if a.size:
             yield (np.clip(a, -1.0, 1.0) * 32767).astype(np.int16)
@@ -359,11 +361,16 @@ def _elevenlabs_ready() -> bool:
                 and _get_elevenlabs_key())
 
 
-def synth_stream(text: str, timeout: float = 30.0):
+def synth_stream(text: str, timeout: float = 30.0, voice: str | None = None):
     """One sentence -> yields (sample_rate, pcm_chunk) as the TTS
     renders. ElevenLabs when configured, Kokoro otherwise — and Kokoro
-    as the fallback on ANY ElevenLabs failure. Degrade, never mute."""
-    if _elevenlabs_ready():
+    as the fallback on ANY ElevenLabs failure. Degrade, never mute.
+
+    `voice` forces a specific Kokoro voice for this call and skips
+    ElevenLabs entirely — an override always means "speak this in a
+    different, distinguishable Kokoro voice," which ElevenLabs can't do
+    with a Kokoro voice name."""
+    if voice is None and _elevenlabs_ready():
         try:
             for pcm in _stream_elevenlabs(text, timeout):
                 yield EL_RATE, pcm
@@ -371,7 +378,7 @@ def synth_stream(text: str, timeout: float = 30.0):
         except Exception as e:
             log(f"[mouth] elevenlabs failed ({str(e)[:60]}) — "
                 f"falling back to {CFG['voice']}")
-    for pcm in _stream_kokoro(text):
+    for pcm in _stream_kokoro(text, voice=voice):
         yield KOKORO_RATE, pcm
 
 
@@ -403,12 +410,14 @@ class Mouth:
         ever arrived to trigger the worker's own idle check)."""
         return self._q.empty() and not self._speaking.is_set()
 
-    def say(self, text: str):
-        """Queue text (split to sentences) for speech."""
+    def say(self, text: str, voice: str | None = None):
+        """Queue text (split to sentences) for speech. `voice` overrides
+        the configured voice for every sentence in this call — used for
+        the local LLM's replies."""
         for s in split_sentences(text):
-            self._q.put((s, None))
+            self._q.put((s, None, voice))
 
-    def say_chunk(self, text: str, directions=None):
+    def say_chunk(self, text: str, directions=None, voice: str | None = None):
         """Queue text as ONE TTS request, no sentence splitting — fuller
         chunks get livelier prosody (single short sentences come out
         dull).
@@ -418,7 +427,7 @@ class Mouth:
         is why they travel with it instead of firing at parse time."""
         text = text.strip()
         if text:
-            self._q.put((text, directions or None))
+            self._q.put((text, directions or None, voice))
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
@@ -448,7 +457,7 @@ class Mouth:
         from backtalk import signals
         while True:
             item = self._q.get()
-            sentence, directions = item if isinstance(item, tuple) else (item, None)
+            sentence, directions, voice = item
             if not sentence:
                 continue
             self._stop.clear()
@@ -457,7 +466,7 @@ class Mouth:
             signals.static_stop()     # thinking sound dies when speech starts
             signals.set_state("speaking")
             try:
-                self._play_stream(sentence, directions)
+                self._play_stream(sentence, directions, voice=voice)
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
@@ -525,12 +534,12 @@ class Mouth:
         self._out_rate = None
 
     def _play_stream(self, sentence: str, directions=None, block: int = 2205,
-                     prebuffer_s: float = 0.75):
+                     prebuffer_s: float = 0.75, voice: str | None = None):
         """Stream-synthesize and play with the head-start buffer (audio
         law #2). stop() reacts ~50ms. The sample rate comes from
         whichever engine actually answered."""
         from backtalk import signals
-        gen = synth_stream(sentence)
+        gen = synth_stream(sentence, voice=voice)
         head: list = []
         banked = 0
         rate = None

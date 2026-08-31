@@ -183,6 +183,75 @@ DEFAULTS = {
                    "acompressor=threshold=-18dB:ratio=2.5:attack=8:"
                    "release=120:makeup=4dB,alimiter=limit=0.95"),
     },
+    # A local, on-device model (MLX) for self-contained questions that
+    # don't need Claude's tools, vault access, or conversation memory —
+    # a quick fact, some math, rephrasing a sentence. Every turn that
+    # reaches Claude reloads the full system prompt and tool set
+    # regardless of how simple the question is, so routing genuinely
+    # self-contained stuff around that entirely saves real tokens. OFF
+    # by default: needs `uv add mlx-lm` and a model download first, and
+    # only makes sense on Apple Silicon. See router.py for how a turn
+    # gets classified local vs cloud, and CLAUDE.md/docs for the voice
+    # this speaks in (deliberately different from the main voice, so a
+    # local answer is never mistaken for Cipher's own).
+    "local_llm": {
+        "enabled": False,
+        "model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+        "max_tokens": 200,
+        # A different Kokoro voice than "voice" above, same language
+        # family so no second Kokoro pipeline has to load. Speaking in
+        # a different voice IS the indicator that this answer came from
+        # the small local model, not from Cipher.
+        "voice": "bf_emma",
+        # Its own name, deliberately not "Cipher"-anything: a wrong or
+        # generic-sounding answer under Cipher's name reads as "Cipher
+        # had a dumb moment" instead of "a much smaller model answered."
+        # Used in log tags and told to the model itself in its own
+        # system prompt (local_llm.py) so it can answer "who are you"
+        # correctly. Also set ai-visualizer.json's local_name to match,
+        # so the face shows this name instead of a generic "LOCAL" tag.
+        "name": "Rosa",
+        # A small, STATIC behavioral framework — Kevin's explicit ask,
+        # 2026-08-31, after agreeing that open-ended/growing memory for
+        # her would recreate the same reliability and governance gap
+        # already ruled out for vault access. Both lists below are
+        # meant to be curated deliberately (by Kevin or Cipher editing
+        # this file), not something Rosa accumulates on her own —
+        # she has no mechanism to write to this file, only read it.
+        "rules": [
+            "Speak conversationally and directly, not formally.",
+            "Never claim to be Cipher/C.I.P.H.E.R. — you are a separate, "
+            "much smaller local model.",
+            "If a question needs specifics about Kevin's actual work, "
+            "projects, files, or past conversations, say plainly that "
+            "you don't have that and it should go to Cipher — never "
+            "guess or invent specifics.",
+        ],
+        # Deliberately generic — no company names, project specifics, or
+        # anything from a firewalled lane (P2P / Bravespan / Trading).
+        # This block has no way to know which lane a given question
+        # belongs to, so it stays lane-agnostic on purpose; anything
+        # more specific belongs in a real turn with Cipher instead.
+        "context": (
+            "The user's name is Kevin. He's a working professional who "
+            "values concise, direct, no-fluff answers over long "
+            "explanations."
+        ),
+        # Who Cipher is, in relation to her — Kevin's explicit ask,
+        # 2026-08-31, so she can answer accurately (not just deflect)
+        # if asked to introduce herself or explain the relationship.
+        "about_cipher": (
+            "Cipher (full name C.I.P.H.E.R.) is Kevin's main AI "
+            "assistant — the senior one in charge, with real tools, "
+            "memory of past conversations, and access to Kevin's own "
+            "files. You were built by Cipher specifically to answer "
+            "small, self-contained questions locally so Kevin doesn't "
+            "spend Claude usage on things that don't need it. If asked "
+            "to introduce yourself, say plainly that you're Rosa, a "
+            "fast local helper working alongside Cipher, who handles "
+            "the real work."
+        ),
+    },
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.
