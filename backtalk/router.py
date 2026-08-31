@@ -57,6 +57,12 @@ CLOUD_KEYWORDS = (
     "wrike", "hedy", "gmail", "calendar", "drive",
     "backtalk", "visualizer", "kokoro", "cipher", "cypher",
     "routine", "trigger", "p2p", "bravespan",
+    # URLs and links: Rosa has no internet access at all, so a link is
+    # ALWAYS a cloud question, unconditionally — confirmed missed live
+    # 2026-08-31 when a pasted GitHub URL fell through (no other keyword
+    # matched) and Rosa hallucinated a description of the repo from its
+    # name alone instead of declining.
+    "http", "www.",
 )
 
 # Spoken to force a question to Claude regardless of what the keyword
@@ -141,6 +147,12 @@ def route(text: str) -> str:
 _AWAITING_CUES = (
     "waiting on your", "want me to", "should i", "need your",
     "let me know", "your call", "go ahead and confirm",
+    # "I'm expecting you to hand me something next" phrasings — missed
+    # live 2026-08-31: "Ready when you paste it" didn't match any cue
+    # above, so the paste that followed fell through to the router
+    # instead of forcing back to whoever asked for it.
+    "when you paste", "go ahead and paste", "paste it", "share it",
+    "send it over",
 )
 
 
