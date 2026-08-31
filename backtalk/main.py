@@ -626,7 +626,7 @@ async def speak_reply_local(mouth: Mouth, text: str) -> bool:
         return False
     local_name = CFG.get("local_llm", {}).get("name") or "local"
     log(f"[{local_name}] ({time.time() - t0:.1f}s) {reply}")
-    _ROUTER_STATE["awaiting_answer"] = reply.rstrip().endswith("?")
+    _ROUTER_STATE["awaiting_answer"] = router.is_awaiting_answer(reply)
     mouth.say(reply, voice=CFG.get("local_llm", {}).get("voice") or None)
     signals.static_stop()
     if mouth.nothing_queued():
@@ -727,7 +727,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         signals.static_stop()
         if local_on:
             _ROUTER_STATE["awaiting_answer"] = (
-                bool(full_reply) and full_reply[-1].endswith("?"))
+                bool(full_reply) and router.is_awaiting_answer(full_reply[-1]))
         if mouth.nothing_queued():
             signals.set_state("idle")
     except asyncio.CancelledError:
@@ -777,6 +777,7 @@ async def amain():
                       can_use_tool=make_permission_gate(mouth),
                       resume_id=resume_id)
     mouth._turn_active = lambda: brain.turn_active
+    mouth._turn_state = lambda: brain.current_state
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"

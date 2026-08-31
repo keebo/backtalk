@@ -95,6 +95,13 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+        # Mirrors the last state ask_stream asked the bus to show
+        # ("thinking"/"working"). mouth.py's own "speaking" write during
+        # playback overwrites the bus file with something stale the
+        # instant the trailing sentence's audio finishes — this lets the
+        # mouth restore the real current state instead of just leaving
+        # the bus on whatever it happened to say last.
+        self._state = "thinking"
 
     @property
     def turn_active(self) -> bool:
@@ -102,6 +109,12 @@ class WarmBrain:
         lands. The mouth reads this before declaring idle, so a turn
         that goes quiet mid-tool-call doesn't read as nothing happening."""
         return self._dirty
+
+    @property
+    def current_state(self) -> str:
+        """What the bus should show right now if nothing else (like
+        mid-sentence playback) has a more current claim on it."""
+        return self._state
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -419,9 +432,11 @@ class WarmBrain:
                         # result came back.
                         cbt = (ev.get("content_block") or {}).get("type")
                         if cbt in ("tool_use", "server_tool_use"):
+                            self._state = "working"
                             signals.set_state("working")
                             signals.static_start()
                         elif cbt == "text":
+                            self._state = "thinking"
                             signals.set_state("thinking")
                     elif ev.get("type") == "content_block_delta":
                         delta = ev.get("delta", {}) or {}

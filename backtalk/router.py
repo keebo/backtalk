@@ -131,3 +131,26 @@ def route(text: str) -> str:
         if kw in low:
             return "cloud"
     return "local"
+
+
+# Phrases that ask Kevin for a decision without necessarily ending the
+# sentence in "?" — confirmed missed live 2026-08-31: "Still waiting on
+# your yes to actually build that one." is exactly this shape, and the
+# bare-"?" check let Kevin's "Yes, build it" fall through to the local
+# router's default instead of forcing back to whoever asked.
+_AWAITING_CUES = (
+    "waiting on your", "want me to", "should i", "need your",
+    "let me know", "your call", "go ahead and confirm",
+)
+
+
+def is_awaiting_answer(sentence: str) -> bool:
+    """True if this (the last spoken sentence of a reply) is the kind
+    of thing that expects Kevin's next utterance to answer it — either
+    a literal question, or one of the common non-"?" phrasings that
+    still asks for a decision."""
+    s = sentence.rstrip()
+    if s.endswith("?"):
+        return True
+    low = s.lower()
+    return any(cue in low for cue in _AWAITING_CUES)

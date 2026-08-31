@@ -399,6 +399,11 @@ class Mouth:
         # worker whether a turn is still in flight, so draining the local
         # speech queue mid-turn doesn't get mistaken for the reply being over.
         self._turn_active = None
+        # Late-bound alongside _turn_active: what the bus should show if
+        # the turn's still going once this sentence is done playing. Without
+        # this the "speaking" write below just sits stale through however
+        # much of the tool call is left — see the finally block.
+        self._turn_state = None
 
     @property
     def speaking(self) -> bool:
@@ -479,10 +484,14 @@ class Mouth:
                     # Only declare idle if the brain agrees the turn is
                     # actually over. Mid-turn (a tool call about to run,
                     # or more text still coming) this queue drains too —
-                    # leave the state as brain.ask_stream last set it
-                    # rather than flashing idle and back.
+                    # restore whatever brain.ask_stream currently wants
+                    # shown instead of leaving the bus on "speaking",
+                    # which this same loop just wrote and which is stale
+                    # the moment audio actually stops.
                     if self._turn_active is None or not self._turn_active():
                         signals.set_state("idle")
+                    elif self._turn_state is not None:
+                        signals.set_state(self._turn_state())
 
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened only when the

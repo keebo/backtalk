@@ -27,13 +27,31 @@ module only knows how, not when.
 """
 import threading
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
+from backtalk import date_calc, math_calc
 from backtalk.config import CFG
 from backtalk.vlog import log
 
 _model = None
 _tokenizer = None
 _lock = threading.Lock()
+
+# Kevin's own timezone, not whatever the machine happens to be set to —
+# same zone daily_token_report.py already anchors on for the same reason.
+_TZ = ZoneInfo("America/New_York")
+
+
+def _today():
+    """Computed fresh on every call, never cached — a stale date baked
+    into a long-lived process would be worse than no date at all."""
+    return datetime.now(_TZ).date()
+
+
+def _current_date_str() -> str:
+    return _today().strftime("%A, %B %-d, %Y")
+
 
 def _system_prompt() -> str:
     """Built fresh each call (cheap string formatting) so a config
@@ -44,7 +62,11 @@ def _system_prompt() -> str:
     Cipher-curated framework, not memory Rosa accumulates herself —
     she has no write path back to config.py, only a read of whatever's
     there when this runs. See config.py's local_llm block for the
-    reasoning."""
+    reasoning. Today's date is the one piece of dynamic, non-curated
+    fact injected here — Kevin flagged 2026-08-31 that she declined a
+    plain "what day is Friday" question for lack of it, and date
+    arithmetic is exactly the kind of self-contained thing she should
+    handle without a Claude turn."""
     cfg = CFG.get("local_llm", {})
     name = cfg.get("name") or "the local assistant"
     base = (
@@ -63,7 +85,9 @@ def _system_prompt() -> str:
     context = cfg.get("context") or ""
     about_cipher = cfg.get("about_cipher") or ""
     rules = cfg.get("rules") or []
-    parts = [base]
+    parts = [base, f"Today's date is {_current_date_str()} — use this "
+             "directly for any date/day-of-week arithmetic instead of "
+             "declining for lack of it."]
     if context:
         parts.append(f"About the user: {context}")
     if about_cipher:
@@ -108,8 +132,21 @@ def warm():
 def _generate_raw(model, tokenizer, text: str) -> str:
     from mlx_lm import generate as _mlx_generate
 
+    system = _system_prompt()
+    # Date arithmetic is exactly what a 7B model gets wrong under
+    # pressure (confirmed 2026-08-31) — resolve any date-relative phrase
+    # in THIS question deterministically and hand it the answer instead
+    # of trusting its own math.
+    dates_note = date_calc.annotate(text, _today())
+    if dates_note:
+        system = f"{system} {dates_note}"
+    # Same reasoning, general arithmetic instead of dates.
+    math_note = math_calc.annotate(text)
+    if math_note:
+        system = f"{system} {math_note}"
+
     prompt = tokenizer.apply_chat_template(
-        [{"role": "system", "content": _system_prompt()},
+        [{"role": "system", "content": system},
          {"role": "user", "content": text}],
         add_generation_prompt=True, tokenize=False)
     max_tokens = CFG.get("local_llm", {}).get("max_tokens", 200)
