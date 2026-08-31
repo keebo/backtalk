@@ -247,15 +247,17 @@ class WarmBrain:
         except Exception:
             pass
 
-    async def command(self, cmd: str) -> str:
+    async def command(self, cmd: str, timeout: float = 90) -> str:
         """Run a console slash command (/clear, /compact, /model,
         /effort) through the normal stream and return whatever text the
         CLI answered with (confirmations, errors). Slash-command replies
         arrive as COMPLETE AssistantMessages, not stream deltas, so
         ask_stream cannot see them. Bounded like reset_turn is: this
         stream is not trusted to always deliver, and an unbounded await
-        here would deafen the whole voice loop. On timeout the pipe is
-        left marked dirty so the next reset_turn drains or rebuilds."""
+        here would deafen the whole voice loop. Caller can widen the
+        bound for commands whose duration scales with conversation size
+        (/compact) rather than being near-instant. On timeout the pipe
+        is left marked dirty so the next reset_turn drains or rebuilds."""
         self._dirty = True
         await self._client.query(cmd)
         texts = []
@@ -275,7 +277,7 @@ class WarmBrain:
                     break
 
         try:
-            await asyncio.wait_for(_collect(), 90)
+            await asyncio.wait_for(_collect(), timeout)
         except asyncio.TimeoutError:
             log(f"[brain] console command timed out: {cmd!r}")
             return "error: the command timed out"

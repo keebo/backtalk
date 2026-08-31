@@ -749,7 +749,7 @@ async def amain():
             say_after = "Cleared. Fresh slate."
         elif verb == "compact":
             mouth.say("Compacting. One moment.")
-            resp = await brain.command("/compact")
+            resp = await brain.command("/compact", timeout=300)
             say_after = "Compacted. Same conversation, smaller footprint."
         elif verb == "deep":
             mouth.say("Switching to the deep model. Heads up, replies "
