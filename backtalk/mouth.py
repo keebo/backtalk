@@ -154,6 +154,33 @@ def _sweep_orphan_espeak_tempdirs():
         log(f"[mouth] swept {swept} orphaned espeak temp dir(s)")
 
 
+_hf_token_cache: str | None = None
+
+
+def _get_hf_token() -> str:
+    """HF Hub token from macOS Keychain (item `backtalk-hf-token`), so
+    Kokoro's model download isn't rate-limited as an anonymous request.
+    Seed it once with:
+      security add-generic-password -a "$USER" -s backtalk-hf-token -T /usr/bin/security -w
+    Falls back to the HF_TOKEN environment variable if Keychain has no entry."""
+    global _hf_token_cache
+    if _hf_token_cache is not None:
+        return _hf_token_cache
+    import subprocess
+    token = ""
+    try:
+        if sys.platform == "darwin":
+            r = subprocess.run(["security", "find-generic-password",
+                                "-s", "backtalk-hf-token", "-w"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                token = r.stdout.strip()
+    except Exception:
+        pass
+    _hf_token_cache = token or os.environ.get("HF_TOKEN", "")
+    return _hf_token_cache
+
+
 def warm():
     """Load the Kokoro pipeline (first call downloads the model to the
     HF cache). Called at startup while the greeting text is composed."""
@@ -161,6 +188,8 @@ def warm():
     with _pipe_lock:
         if _pipe is None:
             _ensure_espeak()
+            if token := _get_hf_token():
+                os.environ["HF_TOKEN"] = token
             # Before kokoro makes this run's scratch dirs, clear the ones
             # earlier runs could not clean up on their way out.
             _sweep_orphan_espeak_tempdirs()

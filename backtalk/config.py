@@ -270,7 +270,10 @@ def load() -> dict:
         thinking = str(REPO / thinking)
     cfg["thinking_sound"] = thinking
     name = str(cfg.get("name") or "Assistant")
-    low = name.lower()
+    # Letters only: a display name like "C.I.P.H.E.R." must still build a
+    # matchable quit phrase — speech-to-text never inserts the periods, so
+    # matching on the punctuated name would never fire.
+    low = "".join(ch for ch in name.lower() if ch.isalpha() or ch == " ")
     cfg["quit_phrases"] = tuple(cfg.get("quit_phrases") or (
         f"goodbye {low}", f"good bye {low}", "end voice mode",
         f"hang up {low}", "hang up"))

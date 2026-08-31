@@ -222,3 +222,48 @@ def static_stop():
         os.remove(_LOADING_PID_FILE)
     except OSError:
         pass
+
+
+def close_visualizer_tab():
+    """Best-effort: close the browser tab ai-visualizer's server.py
+    auto-opened, on hang-up. macOS only (AppleScript, same approach as
+    ducking.py); a silent no-op if the tab's already closed, the
+    browser isn't running, or we're not on macOS. Never raises."""
+    if sys.platform != "darwin":
+        return
+    port = 8790
+    try:
+        with open(os.path.join(_DIR, "ai-visualizer.json")) as f:
+            port = int(json.load(f).get("port", port))
+    except (OSError, ValueError, TypeError):
+        pass
+    needle = f"127.0.0.1:{port}"
+    for script in (
+        f'''
+        if application "Google Chrome" is running then
+            tell application "Google Chrome"
+                repeat with w in windows
+                    repeat with t in (tabs of w)
+                        if URL of t contains "{needle}" then close t
+                    end repeat
+                end repeat
+            end tell
+        end if
+        ''',
+        f'''
+        if application "Safari" is running then
+            tell application "Safari"
+                repeat with w in windows
+                    repeat with t in (tabs of w)
+                        if URL of t contains "{needle}" then close t
+                    end repeat
+                end repeat
+            end tell
+        end if
+        ''',
+    ):
+        try:
+            subprocess.run(["osascript", "-e", script],
+                            capture_output=True, text=True, timeout=2.0)
+        except Exception:
+            pass

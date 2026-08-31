@@ -712,8 +712,11 @@ async def amain():
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
     log("[backtalk] brain warm")
-    # the hidden warmup ping is plumbing, not conversation
+    # the hidden warmup ping is plumbing, not conversation — undo both
+    # of its side effects: the tally it left behind, and the "thinking"
+    # state ask_stream set on the face for a question Kevin never asked.
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
+    signals.set_state("idle")
     # a configured effort level applies at launch (saved by the spoken
     # "set effort to X", or written by the person's agent on request)
     boot_effort = str(CFG.get("effort") or "").strip().lower()
@@ -897,11 +900,11 @@ async def amain():
                     "confirm", "confirmed", "yes confirm",
                     "yes confirmed"):
                 verb = pend + ":confirmed"
-            elif not expired and not any(q in text.lower()
+            elif not expired and not any(q in _norm_speech(text)
                                          for q in QUIT_PHRASES):
                 mouth.say("Staying as we are.")
                 return True
-        if any(q in text.lower() for q in QUIT_PHRASES):
+        if any(q in _norm_speech(text) for q in QUIT_PHRASES):
             if speak_task and not speak_task.done():
                 speak_task.cancel()
             mouth.shut_up()
@@ -1070,6 +1073,7 @@ async def amain():
             speak_task.cancel()
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
         signals.static_stop()
+        signals.close_visualizer_tab()
         signals.set_state("idle")
         await brain.stop()
         log("[backtalk] hung up")
