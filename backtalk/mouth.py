@@ -198,9 +198,23 @@ def warm():
             # a=American English, b=British English, e/f/h/i/j/p/z = the
             # other shipped languages. bm_lewis -> 'b'.
             lang = (CFG["voice"] or "bm_lewis")[0]
+            # Kokoro's own device auto-select only checks torch.cuda,
+            # which is always False on a Mac (that's Nvidia-only) — it
+            # has no idea Apple's MPS backend exists, so it silently
+            # falls back to CPU even when a GPU is sitting right there.
+            # Benchmarked on this machine: MPS beats CPU by ~2.4x in
+            # steady state after the one-time kernel-compile warmup that
+            # this very call already absorbs. Leave device=None (Kokoro's
+            # own cuda/cpu auto-detect) everywhere else, since MPS is
+            # Apple-Silicon-only.
+            device = None
+            if sys.platform == "darwin":
+                import torch
+                if torch.backends.mps.is_available():
+                    device = "mps"
             log(f"[mouth] loading kokoro (lang '{lang}', "
-                f"voice {CFG['voice']})...")
-            _pipe = KPipeline(lang_code=lang)
+                f"voice {CFG['voice']}, device {device or 'auto'})...")
+            _pipe = KPipeline(lang_code=lang, device=device)
             log("[mouth] voice ready")
     return _pipe
 
