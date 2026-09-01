@@ -109,7 +109,7 @@ _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
 # next utterance is forced to cloud regardless of what the router
 # would have picked — a real answer needs the memory that posed the
 # question in the first place.
-_ROUTER_STATE = {"awaiting_answer": False}
+_ROUTER_STATE = {"awaiting_answer": False, "pending_forward": None}
 _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
 # Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
 # a live switch INTO bypassPermissions unless it was launched with the
@@ -635,7 +635,17 @@ async def speak_reply_local(mouth: Mouth, text: str) -> bool:
         return False
     local_name = CFG.get("local_llm", {}).get("name") or "local"
     log(f"[{local_name}] ({time.time() - t0:.1f}s) {reply}")
-    _ROUTER_STATE["awaiting_answer"] = router.is_awaiting_answer(reply)
+    if router.is_forward_offer(reply):
+        # She's offering to escalate — remember the ORIGINAL question,
+        # not just that an answer is pending, so a plain "yes" next
+        # turn can actually resend something Cipher can act on instead
+        # of arriving with zero context. Mutually exclusive with the
+        # generic awaiting_answer flag below.
+        _ROUTER_STATE["pending_forward"] = text
+        _ROUTER_STATE["awaiting_answer"] = False
+    else:
+        _ROUTER_STATE["pending_forward"] = None
+        _ROUTER_STATE["awaiting_answer"] = router.is_awaiting_answer(reply)
     mouth.say(reply, voice=CFG.get("local_llm", {}).get("voice") or None)
     signals.static_stop()
     if mouth.nothing_queued():
@@ -718,6 +728,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
             # — wins over everything else, same priority as the
             # force-local name check below and for the same reason.
             _ROUTER_STATE["awaiting_answer"] = False
+            _ROUTER_STATE["pending_forward"] = None
             if await speak_reply_proofread(mouth, proofread_text):
                 return
             # Local generation itself failed — fall through to the
@@ -731,11 +742,31 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
                 # pending awaiting_answer flag, unlike the keyword
                 # router below.
                 _ROUTER_STATE["awaiting_answer"] = False
+                _ROUTER_STATE["pending_forward"] = None
                 if await speak_reply_local(mouth, local_text):
                     return
                 # Local generation itself failed — fall through to the
                 # normal cloud path below instead of going silent.
                 signals.set_source("cloud")
+            elif _ROUTER_STATE["pending_forward"]:
+                # Rosa just offered to escalate the last question — a
+                # plain "yes" here means "actually send it," so replay
+                # the ORIGINAL question to Cipher, not this one-word
+                # reply (Cipher never sees Rosa's own exchanges, so a
+                # bare "yes" would arrive with no context to act on).
+                # Anything else clears the offer and is treated as a
+                # normal fresh utterance, not forced either direction.
+                original = _ROUTER_STATE["pending_forward"]
+                _ROUTER_STATE["pending_forward"] = None
+                if router.is_affirmative(text):
+                    text = original
+                    signals.set_source("cloud")
+                else:
+                    text, forced = router.strip_force_cloud(text)
+                    if not forced and router.route(text) == "local":
+                        if await speak_reply_local(mouth, text):
+                            return
+                    signals.set_source("cloud")
             elif _ROUTER_STATE["awaiting_answer"]:
                 # This utterance is very likely answering a question
                 # CIPHER just asked (either path) — the router has no

@@ -188,3 +188,47 @@ def is_awaiting_answer(sentence: str) -> bool:
         return True
     low = s.lower()
     return any(cue in low for cue in _AWAITING_CUES)
+
+
+# Rosa offering to escalate a question to Cipher — Kevin's ask
+# 2026-09-01: instead of just declining something outside her lane, she
+# should offer to forward it. Deliberately its own cue set, not folded
+# into _AWAITING_CUES/is_awaiting_answer: that generic mechanism just
+# forces WHATEVER Kevin says next to Cipher with no memory of what
+# prompted it, which is fine for a normal pending question but wrong
+# here — a bare "yes" reaching Cipher with no context is useless, so
+# main.py needs to know specifically that a YES means "resend the
+# original question," not "send this."
+_FORWARD_OFFER_CUES = (
+    "forward this to cipher", "forward it to cipher",
+    "forward that to cipher", "send this to cipher",
+    "send it to cipher", "send that to cipher",
+    "pass this to cipher", "pass it to cipher",
+)
+
+
+def is_forward_offer(sentence: str) -> bool:
+    """True if Rosa's reply is offering to escalate the question that
+    was just asked, rather than a generic pending question of her own."""
+    return any(cue in sentence.lower() for cue in _FORWARD_OFFER_CUES)
+
+
+# A short, deliberately narrow whitelist — matched as whole words/phrases
+# against the normalized utterance, never a raw substring (a raw "yes"
+# substring check would misfire on "yesterday").
+_AFFIRMATIVE_WORDS = ("yes", "yeah", "yep", "yup", "sure", "please",
+                      "confirmed", "confirm")
+_AFFIRMATIVE_PHRASES = ("go ahead", "do it", "send it", "forward it",
+                        "please do")
+
+
+def is_affirmative(text: str) -> bool:
+    """True if this utterance reads as a plain "yes" to a pending
+    yes/no offer — used to decide whether to actually forward a
+    pending question, so it's kept narrow on purpose rather than
+    reusing the broader awaiting-answer cue style."""
+    norm = _norm(text)
+    if any(norm.startswith(p) for p in _AFFIRMATIVE_PHRASES):
+        return True
+    words = norm.split()
+    return bool(words) and words[0] in _AFFIRMATIVE_WORDS

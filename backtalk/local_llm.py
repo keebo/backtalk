@@ -79,8 +79,9 @@ def _system_prompt() -> str:
         "larger assistant). Answer in 1-3 short spoken sentences, "
         "plain prose, no markdown, no lists, no code blocks. If the "
         "question genuinely needs real-world lookup, tool access, or "
-        "memory of a past conversation, say so briefly instead of "
-        "guessing."
+        "memory of a past conversation, don't guess — say in one short "
+        "sentence that Cipher should handle this, then ask exactly: "
+        "\"Want me to forward this to Cipher?\""
     )
     context = cfg.get("context") or ""
     about_cipher = cfg.get("about_cipher") or ""
