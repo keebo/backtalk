@@ -131,6 +131,25 @@ DEFAULTS = {
     # language pipeline (a=American, b=British, e/f/h/i/j/p/z = other
     # languages), so keep voice and accent matched.
     "voice": "bm_lewis",
+    # "auto" (CPU — see mouth.py's warm() for why), "cpu", or "mps".
+    # Confirmed live 2026-08-31: Kokoro's MPS path is genuinely less
+    # clear-sounding than CPU (a real numerics difference in its
+    # conv-based STFT approximation, not just placebo), so "auto" means
+    # CPU now despite MPS being ~2.4x faster in raw throughput — audio
+    # correctness matters more than speed for a voice assistant. Set to
+    # "mps" here to trade clarity back for speed if that tradeoff is
+    # ever wanted again.
+    "voice_device": "auto",
+    # "mlx" (default — Kokoro via mlx-audio, Apple's own MLX framework)
+    # or "pytorch" (the old KPipeline/MPS-or-CPU path, kept as a
+    # fallback). MLX sidesteps the PyTorch-MPS conv-kernel accuracy bug
+    # above entirely rather than working around it. Confirmed live
+    # 2026-08-31, both voices Kevin actually uses (bm_lewis and Rosa's
+    # bf_emma), through a real restarted conversation, not just a
+    # standalone test — "sounds great" both times. Dramatically faster
+    # in steady state than either PyTorch path too (see
+    # 08 - Resources/MLX-Audio Kokoro Prototype.md).
+    "voice_backend": "mlx",
     # Speech recognition (faster-whisper, local, free).
     # Models: tiny.en / base.en / small.en / medium.en — small.en is the
     # accuracy/speed sweet spot on a normal machine.
@@ -198,6 +217,16 @@ DEFAULTS = {
         "enabled": False,
         "model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
         "max_tokens": 200,
+        # Proofread/tone-edit mode's own budget — the output is meant
+        # to be as long as the input paragraph(s), unlike the short
+        # spoken-answer default above. Kevin's ask, 2026-08-31.
+        "edit_max_tokens": 1200,
+        # Where proofread/edit mode writes its output — a plain-text
+        # file Kevin can open and copy from, never spoken aloud in
+        # full. Deterministic code writes this, not Rosa herself — she
+        # has no file-write tool or agency here, same boundary as
+        # always; see main.py's speak_reply_proofread.
+        "edit_output_dir": "/Users/brown/Documents/Rosa",
         # A different Kokoro voice than "voice" above, same language
         # family so no second Kokoro pipeline has to load. Speaking in
         # a different voice IS the indicator that this answer came from

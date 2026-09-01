@@ -634,6 +634,63 @@ async def speak_reply_local(mouth: Mouth, text: str) -> bool:
     return True
 
 
+async def speak_reply_proofread(mouth: Mouth, text: str) -> bool:
+    """Proofread/tone-edit mode ("proofread this: ..."), Kevin's ask
+    2026-08-31: local_llm.edit() on the given text, written to a plain
+    text file he can open and copy from — never spoken aloud in full,
+    since reading paragraphs back out loud is a poor way to proofread.
+    Rosa has no file-write tool or agency here; this function
+    (deterministic backtalk code) does the writing itself, same trust
+    model as the existing log() calls — this does NOT reopen the
+    no-vault-access boundary, it's a fixed, hardcoded output path with
+    no LLM-directed file access at all. Returns True once handled;
+    False on failure, so the caller falls back to cloud rather than
+    going silent."""
+    import subprocess
+    from datetime import datetime
+    from pathlib import Path
+
+    from backtalk import local_llm
+
+    signals.set_source("local")
+    signals.set_state("thinking")
+    signals.static_start()
+    t0 = time.time()
+    loop = asyncio.get_event_loop()
+    try:
+        edited = await loop.run_in_executor(None, local_llm.edit, text)
+    except Exception as e:
+        log(f"[local] edit generation failed ({e}) — falling back to cloud")
+        return False
+    if not edited:
+        log("[local] empty edit reply — falling back to cloud")
+        return False
+
+    out_dir = Path(CFG.get("local_llm", {}).get("edit_output_dir")
+                   or "/Users/brown/Documents/Rosa")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"proofread-{datetime.now():%Y-%m-%d-%H%M%S}.txt"
+    out_path.write_text(edited)
+    # Deterministic, not Rosa's doing — backtalk opens the one file it
+    # just wrote in the default text editor. No new capability for
+    # her: same fixed-path trust model as the write itself, just one
+    # more step so Kevin isn't hunting for it in the folder.
+    try:
+        subprocess.run(["open", str(out_path)], check=False)
+    except Exception as e:
+        log(f"[local] couldn't auto-open {out_path}: {e}")
+
+    local_name = CFG.get("local_llm", {}).get("name") or "local"
+    log(f"[{local_name}] (edit, {time.time() - t0:.1f}s) saved to {out_path}")
+    _ROUTER_STATE["awaiting_answer"] = False
+    signals.static_stop()
+    mouth.say(f"Done — saved the edited version to your {local_name} "
+              "folder.", voice=CFG.get("local_llm", {}).get("voice") or None)
+    if mouth.nothing_queued():
+        signals.set_state("idle")
+    return True
+
+
 async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
@@ -646,33 +703,47 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     have picked."""
     local_on = CFG.get("local_llm", {}).get("enabled")
     if local_on:
-        local_text, forced_local = router.strip_force_local(text)
-        if forced_local:
-            # Addressing her by name ("Rosa, ...") is the most explicit
-            # signal there is — it wins even over a pending
-            # awaiting_answer flag, unlike the keyword router below.
+        proofread_text, is_proofread = router.strip_proofread(text)
+        if is_proofread:
+            # An explicit, deliberate request for a specific capability
+            # — wins over everything else, same priority as the
+            # force-local name check below and for the same reason.
             _ROUTER_STATE["awaiting_answer"] = False
-            if await speak_reply_local(mouth, local_text):
+            if await speak_reply_proofread(mouth, proofread_text):
                 return
             # Local generation itself failed — fall through to the
             # normal cloud path below instead of going silent.
             signals.set_source("cloud")
-        elif _ROUTER_STATE["awaiting_answer"]:
-            # This utterance is very likely answering a question CIPHER
-            # just asked (either path) — the router has no conversation
-            # memory to catch that on keywords alone, so skip it
-            # outright rather than risk the local model getting a
-            # context-free non-sequitur.
-            _ROUTER_STATE["awaiting_answer"] = False
-            signals.set_source("cloud")
         else:
-            text, forced = router.strip_force_cloud(text)
-            if not forced and router.route(text) == "local":
-                if await speak_reply_local(mouth, text):
+            local_text, forced_local = router.strip_force_local(text)
+            if forced_local:
+                # Addressing her by name ("Rosa, ...") is the most
+                # explicit signal there is — it wins even over a
+                # pending awaiting_answer flag, unlike the keyword
+                # router below.
+                _ROUTER_STATE["awaiting_answer"] = False
+                if await speak_reply_local(mouth, local_text):
                     return
                 # Local generation itself failed — fall through to the
                 # normal cloud path below instead of going silent.
-            signals.set_source("cloud")
+                signals.set_source("cloud")
+            elif _ROUTER_STATE["awaiting_answer"]:
+                # This utterance is very likely answering a question
+                # CIPHER just asked (either path) — the router has no
+                # conversation memory to catch that on keywords alone,
+                # so skip it outright rather than risk the local model
+                # getting a context-free non-sequitur.
+                _ROUTER_STATE["awaiting_answer"] = False
+                signals.set_source("cloud")
+            else:
+                text, forced = router.strip_force_cloud(text)
+                if not forced and router.route(text) == "local":
+                    if await speak_reply_local(mouth, text):
+                        return
+                    # Local generation itself failed — fall through to
+                    # the normal cloud path below instead of going
+                    # silent.
+                signals.set_source("cloud")
 
     t0 = time.time()
     first = True

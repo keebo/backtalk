@@ -60,6 +60,9 @@ _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _pipe = None
 _pipe_lock = threading.Lock()
 
+_mlx_model = None
+_mlx_lock = threading.Lock()
+
 
 def _ensure_espeak():
     """kokoro phonemizes through system espeak-ng (its bundled loader
@@ -198,17 +201,30 @@ def warm():
             # a=American English, b=British English, e/f/h/i/j/p/z = the
             # other shipped languages. bm_lewis -> 'b'.
             lang = (CFG["voice"] or "bm_lewis")[0]
-            # Kokoro's own device auto-select only checks torch.cuda,
-            # which is always False on a Mac (that's Nvidia-only) — it
-            # has no idea Apple's MPS backend exists, so it silently
-            # falls back to CPU even when a GPU is sitting right there.
-            # Benchmarked on this machine: MPS beats CPU by ~2.4x in
-            # steady state after the one-time kernel-compile warmup that
-            # this very call already absorbs. Leave device=None (Kokoro's
-            # own cuda/cpu auto-detect) everywhere else, since MPS is
-            # Apple-Silicon-only.
+            # MPS is ~2.4x faster than CPU here in raw steady-state
+            # throughput (benchmarked 2026-08-29), but Kokoro's vocoder
+            # doesn't use a real FFT for its STFT/iSTFT — it uses a
+            # conv1d/conv_transpose1d approximation (kokoro/custom_stft.py,
+            # built for ONNX-export compatibility, avoiding complex-number
+            # ops), and PyTorch's MPS conv kernels compute that
+            # approximation with genuinely different numerics than CPU's.
+            # Confirmed live 2026-08-31: Kevin heard MPS output as
+            # consistently less clear than CPU's, matching an earlier
+            # finding that MPS wasn't corrupting the signal (no clipping,
+            # no NaN) but WAS computing a meaningfully different
+            # rendering (large residual vs. CPU, low-frequency-dominated).
+            # So "auto" now means CPU by default — a real, audible
+            # accuracy regression outweighs the raw speed gain for a
+            # voice assistant. voice_device still lets this be overridden
+            # ("mps" or "cpu") from config without touching this code.
+            override = CFG.get("voice_device", "auto")
             device = None
-            if sys.platform == "darwin":
+            if override == "mps":
+                device = "mps"
+            elif override != "cpu" and override != "auto" \
+                    and sys.platform == "darwin":
+                # Unrecognized value — fall back to the old MPS-preferring
+                # auto-detect rather than silently treating a typo as "cpu".
                 import torch
                 if torch.backends.mps.is_available():
                     device = "mps"
@@ -217,6 +233,51 @@ def warm():
             _pipe = KPipeline(lang_code=lang, device=device)
             log("[mouth] voice ready")
     return _pipe
+
+
+def warm_mlx():
+    """Load Kokoro through mlx-audio (Apple's own MLX framework, not
+    PyTorch/MPS) — the alternative voice_backend, added 2026-08-31.
+
+    Confirmed live: sidesteps the PyTorch-MPS conv-kernel accuracy bug
+    documented in warm()'s own comment above (MPS computing a genuinely
+    different, less clear rendering of Kokoro's conv-based STFT
+    approximation) — Kevin heard this backend as at least as clear as
+    CPU, while a standalone benchmark measured it dramatically faster
+    in steady state than either the old CPU or MPS/PyTorch paths (real
+    time factor ~0.04-0.10 once warm, vs. PyTorch's best case of
+    beating real-time by only ~2.4x on MPS). See
+    08 - Resources/MLX-Audio Kokoro Prototype.md in the vault for the
+    full standalone verification this was built on before touching
+    this file."""
+    global _mlx_model
+    with _mlx_lock:
+        if _mlx_model is None:
+            _ensure_espeak()
+            from mlx_audio.tts.utils import load_model
+            name = CFG.get("voice_backend_model") \
+                or "mlx-community/Kokoro-82M-bf16"
+            log(f"[mouth] loading kokoro via mlx-audio ({name})...")
+            _mlx_model = load_model(name)
+            log("[mouth] voice ready (mlx)")
+    return _mlx_model
+
+
+def _stream_kokoro_mlx(text: str, voice: str | None = None):
+    """One sentence -> int16 PCM chunks at 24kHz, via mlx-audio. Same
+    output contract as _stream_kokoro (same sample rate, same dtype),
+    so synth_stream()'s caller needs no changes either way."""
+    model = warm_mlx()
+    v = voice or CFG["voice"]
+    lang = (v or "bm_lewis")[0]
+    try:
+        speed = float(CFG.get("speed") or 1.0)
+    except (TypeError, ValueError):
+        speed = 1.0
+    for result in model.generate(text, voice=v, lang_code=lang, speed=speed):
+        a = np.asarray(result.audio, dtype=np.float32)
+        if a.size:
+            yield (np.clip(a, -1.0, 1.0) * 32767).astype(np.int16)
 
 
 def split_sentences(text: str) -> list[str]:
@@ -378,7 +439,9 @@ def synth_stream(text: str, timeout: float = 30.0, voice: str | None = None):
         except Exception as e:
             log(f"[mouth] elevenlabs failed ({str(e)[:60]}) — "
                 f"falling back to {CFG['voice']}")
-    for pcm in _stream_kokoro(text, voice=voice):
+    stream_fn = (_stream_kokoro_mlx
+                 if CFG.get("voice_backend") == "mlx" else _stream_kokoro)
+    for pcm in stream_fn(text, voice=voice):
         yield KOKORO_RATE, pcm
 
 

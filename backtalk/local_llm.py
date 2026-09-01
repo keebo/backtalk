@@ -129,27 +129,29 @@ def warm():
     return _model, _tokenizer
 
 
-def _generate_raw(model, tokenizer, text: str) -> str:
+def _generate_raw(model, tokenizer, text: str, system: str | None = None,
+                   max_tokens: int | None = None) -> str:
     from mlx_lm import generate as _mlx_generate
 
-    system = _system_prompt()
-    # Date arithmetic is exactly what a 7B model gets wrong under
-    # pressure (confirmed 2026-08-31) — resolve any date-relative phrase
-    # in THIS question deterministically and hand it the answer instead
-    # of trusting its own math.
-    dates_note = date_calc.annotate(text, _today())
-    if dates_note:
-        system = f"{system} {dates_note}"
-    # Same reasoning, general arithmetic instead of dates.
-    math_note = math_calc.annotate(text)
-    if math_note:
-        system = f"{system} {math_note}"
+    # A caller-supplied system prompt (edit mode) opts out of the
+    # default Q&A framing entirely — date/math annotation only makes
+    # sense there, not when the "question" is actually a block of text
+    # to edit.
+    if system is None:
+        system = _system_prompt()
+        dates_note = date_calc.annotate(text, _today())
+        if dates_note:
+            system = f"{system} {dates_note}"
+        math_note = math_calc.annotate(text)
+        if math_note:
+            system = f"{system} {math_note}"
 
     prompt = tokenizer.apply_chat_template(
         [{"role": "system", "content": system},
          {"role": "user", "content": text}],
         add_generation_prompt=True, tokenize=False)
-    max_tokens = CFG.get("local_llm", {}).get("max_tokens", 200)
+    if max_tokens is None:
+        max_tokens = CFG.get("local_llm", {}).get("max_tokens", 200)
     out = _mlx_generate(model, tokenizer, prompt=prompt,
                         max_tokens=max_tokens, verbose=False)
     return out.strip()
@@ -160,3 +162,38 @@ def generate(text: str) -> str:
     event loop should run this in an executor, not await it directly."""
     model, tokenizer = warm()
     return _generate_raw(model, tokenizer, text)
+
+
+def _edit_system_prompt() -> str:
+    """Deliberately NOT the normal Q&A prompt — proofreading/editing is
+    a return-the-whole-text task, the opposite shape of "1-3 short
+    spoken sentences." Kevin's ask 2026-08-31: correct grammar/spelling
+    on pasted paragraphs, and separately, tone rewrites ("make this
+    more professional/friendly"). One flexible mode covers both — the
+    instruction lives in the user's own message, this prompt just
+    tells the model to follow it and return nothing else."""
+    cfg = CFG.get("local_llm", {})
+    name = cfg.get("name") or "the local assistant"
+    return (
+        f"You are {name}, editing a piece of text exactly as "
+        "instructed. The user's message may include an instruction "
+        "(for example: fix the grammar and spelling, make this more "
+        "professional, make this friendlier) followed by the text to "
+        "edit. If no explicit instruction is given, default to fixing "
+        "grammar and spelling only — do not change tone or meaning "
+        "unless asked. Return ONLY the edited text, preserving the "
+        "original paragraph breaks. No commentary, no preamble, no "
+        "markdown, no quotation marks around the output."
+    )
+
+
+def edit(text: str) -> str:
+    """Proofread/tone-edit mode — a block of text in, the edited block
+    out, no other framing. Much higher token budget than generate()'s
+    short-spoken-answer default, since the output is meant to be as
+    long as the input. Blocking, same as generate()."""
+    model, tokenizer = warm()
+    max_tokens = CFG.get("local_llm", {}).get("edit_max_tokens", 1200)
+    return _generate_raw(model, tokenizer, text,
+                          system=_edit_system_prompt(),
+                          max_tokens=max_tokens)

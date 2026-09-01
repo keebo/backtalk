@@ -130,6 +130,28 @@ def strip_force_local(text: str) -> tuple[str, bool]:
     return text, False
 
 
+# Proofread/tone-edit mode — Kevin's ask 2026-08-31. Unconditional,
+# like strip_force_local: this always means "run local_llm.edit() on
+# whatever follows," regardless of keywords or a pending awaiting_answer
+# state, since it's an explicit, deliberate request for a specific
+# capability rather than an ordinary question that needs routing.
+PROOFREAD_PHRASES = ("proofread this",)
+
+
+def strip_proofread(text: str) -> tuple[str, bool]:
+    """Returns (text_to_edit, triggered). Prefix-matched like the other
+    force phrases — "proofread this" opens the utterance, everything
+    after it (the instruction, if any, plus the text itself) is handed
+    to local_llm.edit() untouched."""
+    norm = _norm(text)
+    for phrase in PROOFREAD_PHRASES:
+        if norm.startswith(phrase):
+            word_count = len(phrase.split())
+            remainder = " ".join(text.split()[word_count:]).strip(" ,.-:")
+            return (remainder or text), True
+    return text, False
+
+
 def route(text: str) -> str:
     """"local" or "cloud" — see module docstring for the reasoning."""
     low = text.lower()
