@@ -232,3 +232,31 @@ def is_affirmative(text: str) -> bool:
         return True
     words = norm.split()
     return bool(words) and words[0] in _AFFIRMATIVE_WORDS
+
+
+# Kevin explicitly asking to resend his last local question through
+# Cipher instead, unprompted by any offer from Rosa — "Rosa, send that
+# to Cipher" after she's already answered something, when he'd rather
+# have Cipher's take. Distinct from _FORWARD_OFFER_CUES (that's HER
+# text offering to escalate); this is HIS command triggering it
+# directly, any time, whether or not she ever offered.
+_RESEND_LAST_CUES = (
+    "send that to cipher", "send that to cypher",
+    "send that last request to cipher", "send that last request to cypher",
+    "send the last request to cipher", "send the last request to cypher",
+    "send that last one to cipher", "send that last one to cypher",
+    "send the last one to cipher", "send the last one to cypher",
+    "forward that to cipher", "forward that to cypher",
+    "forward that last request to cipher", "forward that last request to cypher",
+    "forward the last request to cipher", "forward the last request to cypher",
+    "forward that last one to cipher", "forward that last one to cypher",
+    "forward the last one to cipher", "forward the last one to cypher",
+)
+
+
+def is_resend_last(text: str) -> bool:
+    """True if Kevin is asking to replay his last local question
+    through Cipher instead — checked as a substring so it still
+    matches whether or not he addresses Rosa by name first."""
+    low = text.lower()
+    return any(cue in low for cue in _RESEND_LAST_CUES)

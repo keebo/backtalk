@@ -109,7 +109,8 @@ _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
 # next utterance is forced to cloud regardless of what the router
 # would have picked — a real answer needs the memory that posed the
 # question in the first place.
-_ROUTER_STATE = {"awaiting_answer": False, "pending_forward": None}
+_ROUTER_STATE = {"awaiting_answer": False, "pending_forward": None,
+                  "last_local_question": None}
 _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
 # Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
 # a live switch INTO bypassPermissions unless it was launched with the
@@ -635,6 +636,11 @@ async def speak_reply_local(mouth: Mouth, text: str) -> bool:
         return False
     local_name = CFG.get("local_llm", {}).get("name") or "local"
     log(f"[{local_name}] ({time.time() - t0:.1f}s) {reply}")
+    # Remembered unconditionally (not just when she offers to forward)
+    # so "Rosa, send that to Cipher" works any time Kevin decides he'd
+    # rather have Cipher's take, not just when she flags herself as
+    # out of scope.
+    _ROUTER_STATE["last_local_question"] = text
     if router.is_forward_offer(reply):
         # She's offering to escalate — remember the ORIGINAL question,
         # not just that an answer is pending, so a plain "yes" next
@@ -721,7 +727,20 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     close variants) forces cloud regardless of what the router would
     have picked."""
     local_on = CFG.get("local_llm", {}).get("enabled")
-    if local_on:
+    if local_on and router.is_resend_last(text) and \
+            _ROUTER_STATE.get("last_local_question"):
+        # Kevin explicitly asking to replay his last local question
+        # through Cipher instead, unprompted by any offer from Rosa —
+        # checked before every other branch since it's a command about
+        # routing itself, not a new question to answer (so it must not
+        # fall into strip_force_local and get treated as something to
+        # ask Rosa just because he said her name first).
+        text = _ROUTER_STATE["last_local_question"]
+        _ROUTER_STATE["last_local_question"] = None
+        _ROUTER_STATE["pending_forward"] = None
+        _ROUTER_STATE["awaiting_answer"] = False
+        signals.set_source("cloud")
+    elif local_on:
         proofread_text, is_proofread = router.strip_proofread(text)
         if is_proofread:
             # An explicit, deliberate request for a specific capability
