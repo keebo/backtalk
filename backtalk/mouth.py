@@ -51,7 +51,7 @@ import numpy as np
 import sounddevice as sd
 
 from backtalk.config import CFG
-from backtalk.vlog import log
+from backtalk.vlog import log, log_debug
 
 KOKORO_RATE = 24000
 EL_RATE = 44100
@@ -650,13 +650,20 @@ class Mouth:
                     if self._stop.is_set():
                         return False
                     # write() returns True if PortAudio detected the
-                    # output buffer starve before this call — the actual
-                    # mechanism behind audible crackling/static. Logged
-                    # (not just discarded, the default) so a recurrence
-                    # leaves real timestamped evidence instead of needing
-                    # another blind reboot-and-guess investigation.
+                    # output buffer starve before this call. Confirmed
+                    # 2026-09-01 this fires far more often than it's
+                    # actually audible — likely this loop's own
+                    # feed_waveform() call below doing a disk write on
+                    # nearly every chunk (its ~67ms throttle is shorter
+                    # than a chunk's own ~92ms playback time), so a slow
+                    # write can starve the buffer for a few harmless ms.
+                    # Kept as log_debug (file only, not the live
+                    # transcript) rather than removed entirely: sparse
+                    # hits are noise, but a dense SUSTAINED run of these
+                    # is still the real signature a serious recurrence
+                    # (e.g. the Boom3D driver issue) would leave behind.
                     if out.write(pcm[i:i + block]):
-                        log("[mouth] output underflow — audio buffer starved")
+                        log_debug("[mouth] output underflow — audio buffer starved")
                     # Re-check after the blocking write: a barge-in
                     # landing mid-block must not let feed_waveform
                     # re-assert "speaking" over a fresh "listening".
