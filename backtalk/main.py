@@ -918,14 +918,28 @@ async def amain():
     mouth.say(CFG["greeting"])
 
     loop = asyncio.get_event_loop()
-    # Warm the engines while the greeting plays: the STT model load and
-    # the brain's prompt-cache toll both hide behind the spoken line.
-    loop.run_in_executor(None, warm_ears)
-    if CFG.get("local_llm", {}).get("enabled"):
-        # Same idea: the ~3s MLX load hides behind the greeting instead
-        # of stalling the first local-routed question of the session.
-        from backtalk import local_llm
-        loop.run_in_executor(None, local_llm.warm)
+
+    async def _delayed_warmup():
+        # Give Kokoro's own first synthesis call (the greeting itself,
+        # its slowest call all session -- see the MLX-Audio prototype
+        # note's "first sentence pays a one-time compile cost" finding)
+        # a clear run at the GPU before piling on two more MLX model
+        # loads. Found 2026-09-01: all three landing at once was
+        # stuttering the greeting specifically -- staggered instead of
+        # simultaneous still hides both behind the spoken line (it's a
+        # few seconds long), just not fighting Kokoro for the GPU at
+        # its single most contention-sensitive moment.
+        await asyncio.sleep(1.5)
+        loop.run_in_executor(None, warm_ears)
+        if CFG.get("local_llm", {}).get("enabled"):
+            from backtalk import local_llm
+            loop.run_in_executor(None, local_llm.warm)
+
+    # Reference kept in amain()'s own frame (alive for the whole
+    # session) rather than discarded -- asyncio only holds a WEAK
+    # reference to a task otherwise, which risks it being garbage
+    # collected mid-sleep before ever firing the warmups.
+    _warmup_task = asyncio.create_task(_delayed_warmup())
     # THE BRAIN CONNECT, guarded. This is the one startup step that
     # needs a signed-in Claude Code, internet, and available usage.
     # When it fails or hangs, the mouth still works, so SAY SO instead
