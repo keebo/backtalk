@@ -69,6 +69,19 @@ def _ensure_espeak():
     ships a broken build path — found the hard way; upstream's own docs
     say install the system package). Help phonemizer find it in the
     usual homes when the env isn't already set."""
+    # Cosmetic, but Kevin kept seeing it: misaki's espeak backend logs a
+    # "words count mismatch" warning through Python's standard logging
+    # whenever espeak merges/drops a word during phonemization (normal,
+    # harmless — confirmed no audible correlation). Setting the logger's
+    # level doesn't stick: phonemizer.logger.get_logger() unconditionally
+    # resets both the level AND the handlers back to its own defaults
+    # every time it's called internally, clobbering an external setLevel()
+    # (verified directly — reproduced the exact warning, tried setLevel()
+    # first, it still printed). Patching the INSTANCE's .warning method
+    # survives that, since get_logger() mutates the existing singleton
+    # logger's state but never touches already-bound instance attributes.
+    import logging
+    logging.getLogger("phonemizer").warning = lambda *a, **k: None
     if os.environ.get("PHONEMIZER_ESPEAK_LIBRARY"):
         return
     candidates = (
