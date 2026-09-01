@@ -37,6 +37,15 @@ answered, and the force-cloud phrase below is the escape hatch for
 "no, I want the real answer" without more than half a second of talking.
 """
 
+# Whisper mishears "Cipher" the same handful of ways across every
+# phrase that names her, spoken or typed as a transcript — this is the
+# same catalog backtalk.json's quit_phrases was built from (that file
+# has the original field reports for each spelling). Every cue list
+# below that names Kevin's own spoken reference to Cipher is generated
+# from this tuple instead of hand-typed, so a future mishearing only
+# needs adding once here.
+_CIPHER_MISHEARINGS = ("cipher", "cypher", "slipher", "stifer", "sniper")
+
 # Any of these appearing routes to Claude. Substring match, lowercase,
 # deliberately broad — biased toward over-routing to cloud rather than
 # under-routing, since a mistaken cloud turn just costs some tokens
@@ -55,7 +64,7 @@ CLOUD_KEYWORDS = (
     # this system and Kevin's own tools/data
     "vault", "note", "daily note", "active priorit",
     "wrike", "hedy", "gmail", "calendar", "drive",
-    "backtalk", "visualizer", "kokoro", "cipher", "cypher",
+    "backtalk", "visualizer", "kokoro",
     "routine", "trigger", "p2p", "bravespan",
     # URLs and links: Rosa has no internet access at all, so a link is
     # ALWAYS a cloud question, unconditionally — confirmed missed live
@@ -63,17 +72,16 @@ CLOUD_KEYWORDS = (
     # matched) and Rosa hallucinated a description of the repo from its
     # name alone instead of declining.
     "http", "www.",
-)
+) + _CIPHER_MISHEARINGS
 
 # Spoken to force a question to Claude regardless of what the keyword
 # scan would have decided — the explicit override Kevin asked for.
 # Matched as a PREFIX after normalization, so it's stripped cleanly
 # off the front of the utterance.
-FORCE_CLOUD_PHRASES = (
-    "ask cipher directly",
-    "ask cypher directly",
-    "ask the real cipher",
-    "ask the real cypher",
+FORCE_CLOUD_PHRASES = tuple(
+    f"ask {m} directly" for m in _CIPHER_MISHEARINGS
+) + tuple(
+    f"ask the real {m}" for m in _CIPHER_MISHEARINGS
 )
 
 # The reverse: opening an utterance with the local model's own name
@@ -240,17 +248,16 @@ def is_affirmative(text: str) -> bool:
 # have Cipher's take. Distinct from _FORWARD_OFFER_CUES (that's HER
 # text offering to escalate); this is HIS command triggering it
 # directly, any time, whether or not she ever offered.
-_RESEND_LAST_CUES = (
-    "send that to cipher", "send that to cypher",
-    "send that last request to cipher", "send that last request to cypher",
-    "send the last request to cipher", "send the last request to cypher",
-    "send that last one to cipher", "send that last one to cypher",
-    "send the last one to cipher", "send the last one to cypher",
-    "forward that to cipher", "forward that to cypher",
-    "forward that last request to cipher", "forward that last request to cypher",
-    "forward the last request to cipher", "forward the last request to cypher",
-    "forward that last one to cipher", "forward that last one to cypher",
-    "forward the last one to cipher", "forward the last one to cypher",
+_RESEND_LAST_TEMPLATES = (
+    "send that to {m}",
+    "send that last request to {m}", "send the last request to {m}",
+    "send that last one to {m}", "send the last one to {m}",
+    "forward that to {m}",
+    "forward that last request to {m}", "forward the last request to {m}",
+    "forward that last one to {m}", "forward the last one to {m}",
+)
+_RESEND_LAST_CUES = tuple(
+    t.format(m=m) for t in _RESEND_LAST_TEMPLATES for m in _CIPHER_MISHEARINGS
 )
 
 
