@@ -636,7 +636,14 @@ class Mouth:
                 for i in range(0, len(pcm), block):
                     if self._stop.is_set():
                         return False
-                    out.write(pcm[i:i + block])
+                    # write() returns True if PortAudio detected the
+                    # output buffer starve before this call — the actual
+                    # mechanism behind audible crackling/static. Logged
+                    # (not just discarded, the default) so a recurrence
+                    # leaves real timestamped evidence instead of needing
+                    # another blind reboot-and-guess investigation.
+                    if out.write(pcm[i:i + block]):
+                        log("[mouth] output underflow — audio buffer starved")
                     # Re-check after the blocking write: a barge-in
                     # landing mid-block must not let feed_waveform
                     # re-assert "speaking" over a fresh "listening".
