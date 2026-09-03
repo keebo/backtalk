@@ -46,6 +46,8 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
+from collections import deque
 
 import numpy as np
 import sounddevice as sd
@@ -66,6 +68,19 @@ _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 # accepted here because the alternative, confirmed live 2026-09-02, is
 # staying silent for the rest of the session.
 _UNDERFLOW_RECOVERY_THRESHOLD = 10
+
+# A second, independent trigger for a different failure shape than the
+# consecutive-run one above: underflow that's FREQUENT but not back-to-back
+# (a real successful write lands between most hits, so the consecutive
+# counter keeps resetting to 0 and never fires). Confirmed live 2026-09-03
+# -- roughly one underflow every 10-25s for 22 straight minutes, clearly
+# audible degradation, and the consecutive-run watchdog above never
+# triggered once through the whole thing because nothing in that pattern
+# was ever actually back-to-back. Tracked as a rolling window of
+# timestamps rather than a simple counter so it naturally forgets old,
+# unrelated hits instead of accumulating forever across a long session.
+_UNDERFLOW_BURST_WINDOW_S = 90
+_UNDERFLOW_BURST_THRESHOLD = 8
 
 _pipe = None
 _pipe_lock = threading.Lock()
@@ -492,6 +507,7 @@ class Mouth:
         self._out_rate: int | None = None
         self._out_device: str | None = None
         self._consecutive_underflows = 0
+        self._underflow_burst: deque[float] = deque()
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
@@ -551,7 +567,6 @@ class Mouth:
 
     def wait_done(self, timeout: float | None = None):
         """Block until the queue is drained and playback finished."""
-        import time
         deadline = None if timeout is None else time.time() + timeout
         while (not self._q.empty()) or self._speaking.is_set():
             time.sleep(0.05)
@@ -702,18 +717,30 @@ class Mouth:
                     if out.write(pcm[i:i + block]):
                         self._consecutive_underflows += 1
                         log_debug("[mouth] output underflow — audio buffer starved")
-                        if self._consecutive_underflows >= _UNDERFLOW_RECOVERY_THRESHOLD:
-                            # The sustained-run signature the comment above
-                            # warns about: the device is stale, not just
-                            # momentarily slow. write() will keep silently
-                            # "succeeding" forever on a device like this, so
-                            # nothing else self-heals it — force a fresh
-                            # stream now rather than staying silent for the
-                            # rest of the session.
-                            log("[mouth] sustained underflow — reopening output stream")
+
+                        now = time.monotonic()
+                        self._underflow_burst.append(now)
+                        while (self._underflow_burst
+                               and now - self._underflow_burst[0] > _UNDERFLOW_BURST_WINDOW_S):
+                            self._underflow_burst.popleft()
+
+                        sustained = self._consecutive_underflows >= _UNDERFLOW_RECOVERY_THRESHOLD
+                        bursty = len(self._underflow_burst) >= _UNDERFLOW_BURST_THRESHOLD
+                        if sustained or bursty:
+                            # Two different failure shapes land here: a
+                            # fully-stale device (the sustained/consecutive
+                            # signature) and frequent-but-spaced-out
+                            # underflow (the burst-window signature) --
+                            # write() will keep silently "succeeding"
+                            # forever either way, so nothing else self-heals
+                            # it. Force a fresh stream now rather than
+                            # staying degraded for the rest of the session.
+                            log(f"[mouth] {'sustained' if sustained else 'frequent'} "
+                                f"underflow — reopening output stream")
                             self._drop_out()
                             out = self._get_out(rate)
                             self._consecutive_underflows = 0
+                            self._underflow_burst.clear()
                     else:
                         self._consecutive_underflows = 0
                     # Re-check after the blocking write: a barge-in
