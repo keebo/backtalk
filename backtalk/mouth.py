@@ -57,6 +57,16 @@ KOKORO_RATE = 24000
 EL_RATE = 44100
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 
+# A device that's gone silently stale (e.g. after the system sat idle) can
+# keep reporting underflow on every write forever without ever raising an
+# exception — so _drop_out()'s existing exception-triggered self-heal never
+# fires. This is the backstop: a run of consecutive underflow hits within
+# one sentence forces the same recovery exceptional-path takes. This does
+# knowingly cost the audio-law-#1 stream continuity (a brief onset blip) —
+# accepted here because the alternative, confirmed live 2026-09-02, is
+# staying silent for the rest of the session.
+_UNDERFLOW_RECOVERY_THRESHOLD = 10
+
 _pipe = None
 _pipe_lock = threading.Lock()
 
@@ -468,6 +478,7 @@ class Mouth:
         # Worker-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
+        self._consecutive_underflows = 0
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
@@ -646,6 +657,7 @@ class Mouth:
                 _sig.direction(directions)
 
             def _write(pcm):
+                nonlocal out
                 for i in range(0, len(pcm), block):
                     if self._stop.is_set():
                         return False
@@ -663,7 +675,22 @@ class Mouth:
                     # is still the real signature a serious recurrence
                     # (e.g. the Boom3D driver issue) would leave behind.
                     if out.write(pcm[i:i + block]):
+                        self._consecutive_underflows += 1
                         log_debug("[mouth] output underflow — audio buffer starved")
+                        if self._consecutive_underflows >= _UNDERFLOW_RECOVERY_THRESHOLD:
+                            # The sustained-run signature the comment above
+                            # warns about: the device is stale, not just
+                            # momentarily slow. write() will keep silently
+                            # "succeeding" forever on a device like this, so
+                            # nothing else self-heals it — force a fresh
+                            # stream now rather than staying silent for the
+                            # rest of the session.
+                            log("[mouth] sustained underflow — reopening output stream")
+                            self._drop_out()
+                            out = self._get_out(rate)
+                            self._consecutive_underflows = 0
+                    else:
+                        self._consecutive_underflows = 0
                     # Re-check after the blocking write: a barge-in
                     # landing mid-block must not let feed_waveform
                     # re-assert "speaking" over a fresh "listening".
