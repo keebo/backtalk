@@ -53,6 +53,7 @@ import time
 import numpy as np
 
 from backtalk.config import CFG
+from backtalk.vlog import log_debug
 
 _DIR = CFG["signals_dir"]
 _STATE_FILE = os.path.join(_DIR, ".voice_state")
@@ -73,9 +74,20 @@ _WAVEFORM_MIN_INTERVAL = 1.0 / 15   # ~15 writes/sec is plenty for 60fps reads
 _last_waveform_write = 0.0
 _static_proc: subprocess.Popen | None = None
 
+# Late-bound by main.py once the Mouth exists: lets static_start() check
+# whether audio is already playing before adding the thinking sound on
+# top of it. Same binding pattern as mouth._turn_active/_turn_state.
+is_speaking = None
+
 
 def set_state(name: str):
     """Write the state. Never raises — the show must go on."""
+    # Temporary diagnostic (2026-09-02): a real, unexplained "stuck on
+    # working during genuine silence" report came in with no way to see
+    # which caller wrote what, when. file-only (log_debug) since
+    # feed_waveform's self-heal calls this ~15x/sec during playback —
+    # too noisy for the live transcript, fine for after-the-fact digging.
+    log_debug(f"[signals] set_state -> {name}")
     try:
         with open(_STATE_FILE, "w") as f:
             f.write(name)
@@ -210,9 +222,17 @@ def _player_cmd(path: str) -> list[str] | None:
 
 
 def static_start():
-    """Optional thinking sound — plays while the brain works."""
+    """Optional thinking sound — plays while the brain works.
+
+    Skips entirely if audio is already playing: a tool call can start
+    (and with it, this sound) while an earlier sentence of the same
+    reply is still audibly speaking, since static_stop() only runs at
+    the NEXT sentence boundary — without this guard the thinking sound
+    would play right over live speech until that boundary arrives."""
     global _static_proc
     if not _THINKING_SOUND or not os.path.exists(_THINKING_SOUND):
+        return
+    if is_speaking is not None and is_speaking():
         return
     static_stop()
     cmd = _player_cmd(_THINKING_SOUND)

@@ -908,6 +908,13 @@ async def amain():
                       resume_id=resume_id)
     mouth._turn_active = lambda: brain.turn_active
     mouth._turn_state = lambda: brain.current_state
+    # A tool call can start (and with it, the thinking sound) while a
+    # sentence from an EARLIER part of the same reply is still audibly
+    # playing — static_stop() only fires at the next sentence boundary,
+    # so without this the thinking sound plays right over live speech
+    # until that boundary arrives. Refusing to start it at all while
+    # already speaking is simpler than chasing that boundary.
+    signals.is_speaking = lambda: mouth.speaking
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
