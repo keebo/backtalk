@@ -947,6 +947,21 @@ async def amain():
     # reference to a task otherwise, which risks it being garbage
     # collected mid-sleep before ever firing the warmups.
     _warmup_task = asyncio.create_task(_delayed_warmup())
+    # Give Kokoro's own compile-heavy first synthesis call (queued via
+    # mouth.say(greeting) just above, already running on the mouth's own
+    # worker thread) a brief head start before brain.start()'s CPU-heavy,
+    # deliberately-unthrottled subprocess spawn begins. This is the
+    # residual contention the 2026-09-01 ears/Rosa stagger above didn't
+    # cover -- confirmed by real evidence that same day: underflow
+    # events clustered in a 5-second window right where Kokoro finished
+    # loading and started speaking while brain connect was still running
+    # underneath it. Deliberately much smaller than the 1.5s ears/Rosa
+    # stagger: brain connect routinely takes several seconds on its own
+    # (subprocess spawn, Claude Code init, MCP handshakes), so this
+    # rounds to nothing against "Cipher ready ASAP" while still giving
+    # Kokoro's specific compile window room to clear first.
+    await asyncio.sleep(0.4)
+
     # THE BRAIN CONNECT, guarded. This is the one startup step that
     # needs a signed-in Claude Code, internet, and available usage.
     # When it fails or hangs, the mouth still works, so SAY SO instead
