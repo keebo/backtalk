@@ -483,11 +483,36 @@ def synth_stream(text: str, timeout: float = 30.0, voice: str | None = None):
         yield KOKORO_RATE, pcm
 
 
+_DEVICE_REFRESH_INTERVAL_S = 20
+_last_device_refresh = 0.0
+
+
 def _default_output_name() -> str | None:
     """Name of the current default output device, or None if it can't be
     read. Used to catch a system-level output switch (e.g. dock -> Mac
     speakers) that happens while our stream sits open — PortAudio won't
-    raise on that by itself, so nothing else would notice."""
+    raise on that by itself, so nothing else would notice.
+
+    PortAudio caches its device list at init time, so a plain query here
+    can silently report a default that stopped being true hours ago --
+    confirmed live 2026-09-03, a real switch to "MacBook Pro Speakers"
+    never once showed up. ears._reopen_after_device_change already fixes
+    this exact staleness for the mic, but only as a last resort when
+    opening the mic stream fails outright -- there's no equivalent
+    failure signal on the output side, since a stale stream here just
+    keeps writing into nothing instead of erroring. So this refreshes
+    proactively instead, rate-limited so it doesn't force a stream
+    rebuild (which drops every open stream, mic included -- see
+    ears._reopen_after_device_change) on every single sentence."""
+    global _last_device_refresh
+    now = time.monotonic()
+    if now - _last_device_refresh > _DEVICE_REFRESH_INTERVAL_S:
+        _last_device_refresh = now
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
     try:
         idx = sd.default.device[1]
         return sd.query_devices()[idx]["name"]
