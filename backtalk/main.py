@@ -56,6 +56,7 @@ import asyncio
 import json
 import queue
 import re
+import signal
 import socket
 import sys
 import threading
@@ -159,6 +160,21 @@ def _norm_speech(text):
     for ch in text.lower():
         out.append(ch if "a" <= ch <= "z" else " ")
     return " ".join("".join(out).split())
+
+
+def _is_quit(text: str) -> bool:
+    """A quit phrase only counts when it OPENS the utterance. Real
+    incident 2026-09-03: a substring check anywhere in the sentence
+    disconnected the session mid-instruction because a quit phrase
+    happened to appear in the middle of a long, unrelated request.
+    Prefix-checked with a word-boundary guard so "hang up" doesn't also
+    fire on "hang uptown"."""
+    norm = _norm_speech(text)
+    for q in QUIT_PHRASES:
+        nq = _norm_speech(q)
+        if norm == nq or norm.startswith(nq + " "):
+            return True
+    return False
 
 
 def _deny_pending(reason=_INTERRUPT_ANSWER):
@@ -926,6 +942,20 @@ async def amain():
 
     loop = asyncio.get_event_loop()
 
+    # External graceful hangup: a Stream Deck button (or any other
+    # script) that wants to replace a running session sends SIGUSR1
+    # instead of pkill's default SIGTERM, so it gets the same clean
+    # goodbye as speaking the quit phrase -- signoff spoken, visualizer
+    # tab closed, music restored -- rather than an unceremonious kill
+    # that skips all of that. Not available on Windows (no POSIX
+    # signals), so this is a silent no-op there; pkill still works, it
+    # just goes back to being an abrupt kill on that platform.
+    hangup_event = asyncio.Event()
+    try:
+        loop.add_signal_handler(signal.SIGUSR1, hangup_event.set)
+    except (NotImplementedError, AttributeError):
+        pass
+
     async def _delayed_warmup():
         # Give Kokoro's own first synthesis call (the greeting itself,
         # its slowest call all session -- see the MLX-Audio prototype
@@ -1177,11 +1207,10 @@ async def amain():
                     "confirm", "confirmed", "yes confirm",
                     "yes confirmed"):
                 verb = pend + ":confirmed"
-            elif not expired and not any(q in _norm_speech(text)
-                                         for q in QUIT_PHRASES):
+            elif not expired and not _is_quit(text):
                 mouth.say("Staying as we are.")
                 return True
-        if any(q in _norm_speech(text) for q in QUIT_PHRASES):
+        if _is_quit(text):
             if speak_task and not speak_task.done():
                 speak_task.cancel()
             mouth.shut_up()
@@ -1240,6 +1269,7 @@ async def amain():
         ptt = PTTListener(CFG["ptt_key"])
         press_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
+        hangup_fut = asyncio.ensure_future(hangup_event.wait())
         mic_gen_seen = _MIC["gen"]
         # The open mic yields while the BUTTON records (or the double
         # capture would turn one held utterance into two turns), and,
@@ -1260,7 +1290,7 @@ async def amain():
                 typed_fut = loop.run_in_executor(None, typed_q.get)
             if press_fut is None:
                 press_fut = loop.run_in_executor(None, ptt.wait_press)
-            waiters = {press_fut, typed_fut}
+            waiters = {press_fut, typed_fut, hangup_fut}
             if _MIC["mode"] == "open":
                 if mic_fut is None:
                     g = _MIC["gen"]
@@ -1271,6 +1301,18 @@ async def amain():
                 waiters.add(mic_fut)
             done, _ = await asyncio.wait(
                 waiters, return_when=asyncio.FIRST_COMPLETED)
+            if hangup_fut in done:
+                # Same shutdown the spoken quit phrase triggers (signoff,
+                # visualizer tab close, music restore all happen in the
+                # `finally` below and in mouth/signals' own cleanup) --
+                # this is just a different way in.
+                log("[backtalk] SIGUSR1 received — hanging up gracefully")
+                if speak_task and not speak_task.done():
+                    speak_task.cancel()
+                mouth.shut_up()
+                mouth.say(CFG["signoff"])
+                mouth.wait_done(timeout=15)
+                return
             if typed_fut in done:
                 text = typed_fut.result(); typed_fut = None
                 if text and not await handle(text):

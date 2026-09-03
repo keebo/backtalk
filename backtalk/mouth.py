@@ -468,6 +468,18 @@ def synth_stream(text: str, timeout: float = 30.0, voice: str | None = None):
         yield KOKORO_RATE, pcm
 
 
+def _default_output_name() -> str | None:
+    """Name of the current default output device, or None if it can't be
+    read. Used to catch a system-level output switch (e.g. dock -> Mac
+    speakers) that happens while our stream sits open — PortAudio won't
+    raise on that by itself, so nothing else would notice."""
+    try:
+        idx = sd.default.device[1]
+        return sd.query_devices()[idx]["name"]
+    except Exception:
+        return None
+
+
 class Mouth:
     def __init__(self):
         from backtalk.ducking import Ducker
@@ -478,6 +490,7 @@ class Mouth:
         # Worker-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
+        self._out_device: str | None = None
         self._consecutive_underflows = 0
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         self._worker = threading.Thread(target=self._run, daemon=True)
@@ -581,10 +594,18 @@ class Mouth:
                         signals.set_state(self._turn_state())
 
     def _get_out(self, rate: int) -> sd.OutputStream:
-        """The long-lived stream (audio law #1). Reopened only when the
-        sample rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback:
-        rare, costs at most one blip on the switch)."""
-        if self._out is not None and self._out_rate == rate:
+        """The long-lived stream (audio law #1). Reopened when the sample
+        rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback: rare,
+        costs at most one blip on the switch), or when the default output
+        device itself has changed since we opened it (e.g. the user
+        switches from headphones to speakers) — PortAudio doesn't error
+        on that, it just keeps writing into a stream that no longer
+        matches reality, which is how you get static instead of silence."""
+        current_device = _default_output_name()
+        device_changed = (current_device is not None
+                           and self._out_device is not None
+                           and current_device != self._out_device)
+        if self._out is not None and self._out_rate == rate and not device_changed:
             # Guarded, because the stream can die UNDER us: the ears
             # rebuild the whole audio system to recover from a device
             # change (see ears._reopen_after_device_change), and that
@@ -598,9 +619,13 @@ class Mouth:
                 return self._out
             except Exception:
                 log("[mouth] the output stream went away, reopening")
+        if device_changed:
+            log(f"[mouth] default output changed ({self._out_device!r} -> "
+                f"{current_device!r}), reopening")
         self._drop_out()
         self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
         self._out_rate = rate
+        self._out_device = current_device
         self._out.start()
         return self._out
 
