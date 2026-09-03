@@ -43,6 +43,7 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -483,8 +484,32 @@ def synth_stream(text: str, timeout: float = 30.0, voice: str | None = None):
         yield KOKORO_RATE, pcm
 
 
-_DEVICE_REFRESH_INTERVAL_S = 20
+_DEVICE_REFRESH_INTERVAL_S = 60
 _last_device_refresh = 0.0
+_last_switchaudio_name: str | None = None
+_switchaudio_path: str | None = None
+_switchaudio_checked = False
+
+
+def _switchaudio_output_name() -> str | None:
+    """Cheap, always-fresh ground truth for the current default output,
+    via the SwitchAudioSource CLI -- it asks CoreAudio directly on
+    every call, no caching problem, unlike PortAudio's own device list
+    (see below). macOS only, and only if installed (checked once,
+    memoized); returns None otherwise so the rate-limited PortAudio
+    fallback below still covers every other platform."""
+    global _switchaudio_path, _switchaudio_checked
+    if not _switchaudio_checked:
+        _switchaudio_checked = True
+        _switchaudio_path = shutil.which("SwitchAudioSource")
+    if not _switchaudio_path:
+        return None
+    try:
+        result = subprocess.run([_switchaudio_path, "-t", "output", "-c"],
+                                 capture_output=True, text=True, timeout=2)
+        return result.stdout.strip() or None
+    except Exception:
+        return None
 
 
 def _default_output_name() -> str | None:
@@ -500,19 +525,41 @@ def _default_output_name() -> str | None:
     this exact staleness for the mic, but only as a last resort when
     opening the mic stream fails outright -- there's no equivalent
     failure signal on the output side, since a stale stream here just
-    keeps writing into nothing instead of erroring. So this refreshes
-    proactively instead, rate-limited so it doesn't force a stream
-    rebuild (which drops every open stream, mic included -- see
-    ears._reopen_after_device_change) on every single sentence."""
-    global _last_device_refresh
-    now = time.monotonic()
-    if now - _last_device_refresh > _DEVICE_REFRESH_INTERVAL_S:
-        _last_device_refresh = now
-        try:
-            sd._terminate()
-            sd._initialize()
-        except Exception:
-            pass
+    keeps writing into nothing instead of erroring.
+
+    First fix tried (same day): force the PortAudio refresh on a blind
+    20s timer. That was wrong and made things worse, not better --
+    confirmed live: it rebuilt the whole audio system (which drops
+    every open stream, mic included) on close to every other sentence
+    during actual conversation, not "rarely," causing the exact kind
+    of dropped/degraded audio this was supposed to fix. The real
+    problem was refreshing on a schedule instead of on evidence of an
+    actual change. Now: ask SwitchAudioSource for the real current
+    default (cheap, always fresh, no caching problem) and only pay the
+    disruptive PortAudio rebuild when that disagrees with what we last
+    saw. Falls back to the old rate-limited blind refresh, at a longer
+    interval, only on a platform without SwitchAudioSource."""
+    global _last_device_refresh, _last_switchaudio_name
+    switch_name = _switchaudio_output_name()
+    if switch_name is not None:
+        changed = (_last_switchaudio_name is not None
+                   and switch_name != _last_switchaudio_name)
+        _last_switchaudio_name = switch_name
+        if changed:
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                pass
+    else:
+        now = time.monotonic()
+        if now - _last_device_refresh > _DEVICE_REFRESH_INTERVAL_S:
+            _last_device_refresh = now
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                pass
     try:
         idx = sd.default.device[1]
         return sd.query_devices()[idx]["name"]
