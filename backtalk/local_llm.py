@@ -198,3 +198,44 @@ def edit(text: str) -> str:
     return _generate_raw(model, tokenizer, text,
                           system=_edit_system_prompt(),
                           max_tokens=max_tokens)
+
+
+def _delegate_system_prompt() -> str:
+    """Deliberately NOT the voice Q&A prompt: no "answer in 1-3 spoken
+    sentences" (a delegated sub-task's result might be a paragraph,
+    a list, a rewritten block — whatever shape fits), and no
+    decline-and-offer-to-forward behavior (see _system_prompt) — that
+    exists for a live conversation with Kevin where an out-of-scope
+    question needs a graceful redirect. Here the caller is Cipher, not
+    Kevin, and Cipher has already judged the sub-task is self-contained
+    before handing it over, so there's no one to redirect to and
+    nothing to decline. Kevin's ask 2026-09-03: a way to offload
+    self-contained pieces of a larger task to save Claude tokens,
+    without inheriting Rosa's voice-specific framing built for a
+    completely different calling context."""
+    cfg = CFG.get("local_llm", {})
+    name = cfg.get("name") or "the local assistant"
+    return (
+        f"You are {name}, completing a specific, self-contained "
+        "sub-task handed to you by Cipher, the user's main assistant "
+        "— not answering a live spoken question. Complete the task "
+        "exactly as instructed and return ONLY the result: no "
+        "commentary, no preamble, no meta-discussion about the task, "
+        "no markdown unless the result itself calls for it (e.g. a "
+        "requested list)."
+    )
+
+
+def delegate(text: str) -> str:
+    """A self-contained sub-task in, the result out — no voice-reply
+    framing, no decline/forward behavior. For Cipher (not Kevin) to
+    call directly on a piece of a larger task that doesn't need tools,
+    file access, or conversation memory, saving a full Claude turn on
+    work a local model can do reliably enough. Same higher token
+    budget as edit(), since a delegated result's length should fit the
+    task, not a spoken-reply limit. Blocking, same as generate()."""
+    model, tokenizer = warm()
+    max_tokens = CFG.get("local_llm", {}).get("edit_max_tokens", 1200)
+    return _generate_raw(model, tokenizer, text,
+                          system=_delegate_system_prompt(),
+                          max_tokens=max_tokens)
