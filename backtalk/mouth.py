@@ -770,6 +770,25 @@ class Mouth:
 
             def _write(pcm):
                 nonlocal out
+                # Diagnostic added 2026-09-03: hours of dead-silent
+                # replies tonight left NO signal anywhere in this file --
+                # no underflow (write() never reported starvation), no
+                # exception, nothing. That's consistent with Kokoro
+                # itself handing back a chunk of real-looking but
+                # near-zero-amplitude audio under heavy system load
+                # (Metal/GPU contention corrupting inference, a timeout
+                # returning a zeroed buffer, etc.) -- this file would
+                # faithfully write that silence with a clean conscience,
+                # since "wrote successfully" and "wrote audible sound"
+                # are different claims and only the first one was ever
+                # checked. Not yet confirmed as the actual mechanism --
+                # this only proves or rules it out next time it happens.
+                if len(pcm) > 0:
+                    peak = int(np.abs(pcm).max())
+                    if peak < 50:  # int16 range is +/-32768; this is near-silent
+                        log(f"[mouth] synthesized chunk is near-silent "
+                            f"(peak amplitude {peak}/32768, {len(pcm)} samples) "
+                            f"-- Kokoro may have returned empty/corrupted audio")
                 for i in range(0, len(pcm), block):
                     if self._stop.is_set():
                         return False
