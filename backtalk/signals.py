@@ -265,23 +265,40 @@ def close_visualizer_tab():
     """Best-effort: close the browser tab ai-visualizer's server.py
     auto-opened, on hang-up. macOS only (AppleScript, same approach as
     ducking.py); a silent no-op if the tab's already closed, the
-    browser isn't running, or we're not on macOS. Never raises."""
+    browser isn't running, or we're not on macOS. Never raises.
+
+    If ai-visualizer.json sets "open_app" (a standalone .app -- e.g. a
+    Safari "Add to Dock" web app -- that server.py launches instead of a
+    browser tab, see ai-visualizer/server.py's open_visualizer()), quit
+    that app too. It's a separate application, not a Safari/Chrome tab,
+    so the URL-matching tab-close below can never reach it."""
     if sys.platform != "darwin":
         return
     port = 8790
+    open_app = None
     try:
         with open(os.path.join(_DIR, "ai-visualizer.json")) as f:
-            port = int(json.load(f).get("port", port))
+            cfg = json.load(f)
+            port = int(cfg.get("port", port))
+            open_app = cfg.get("open_app")
     except (OSError, ValueError, TypeError):
         pass
-    needle = f"127.0.0.1:{port}"
-    for script in (
+    # Match both hostname forms -- "127.0.0.1" and "localhost" resolve to
+    # the same server but are different strings, and a plain "contains"
+    # check won't bridge them. Found 2026-09-05: a tab opened via
+    # "http://localhost:8790/..." was silently missed by a 127.0.0.1-only
+    # needle.
+    needle_ip = f"127.0.0.1:{port}"
+    needle_host = f"localhost:{port}"
+    match = (f'(URL of t contains "{needle_ip}") or '
+             f'(URL of t contains "{needle_host}")')
+    scripts = [
         f'''
         if application "Google Chrome" is running then
             tell application "Google Chrome"
                 repeat with w in windows
                     repeat with t in (tabs of w)
-                        if URL of t contains "{needle}" then close t
+                        if {match} then close t
                     end repeat
                 end repeat
             end tell
@@ -292,13 +309,20 @@ def close_visualizer_tab():
             tell application "Safari"
                 repeat with w in windows
                     repeat with t in (tabs of w)
-                        if URL of t contains "{needle}" then close t
+                        if {match} then close t
                     end repeat
                 end repeat
             end tell
         end if
         ''',
-    ):
+    ]
+    if open_app:
+        scripts.append(f'''
+        if application "{open_app}" is running then
+            tell application "{open_app}" to quit
+        end if
+        ''')
+    for script in scripts:
         try:
             subprocess.run(["osascript", "-e", script],
                             capture_output=True, text=True, timeout=2.0)
