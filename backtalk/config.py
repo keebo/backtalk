@@ -115,6 +115,15 @@ DEFAULTS = {
     # A resume that fails falls back to a fresh session and says so in
     # the log. (Grew out of the same community proposal, issue #1.)
     "resume_last_session": False,
+    # Max bytes the SDK will buffer for a SINGLE JSON message from the
+    # CLI subprocess. The SDK default is 1 MB, and one oversized tool
+    # result (a big file read, a long command output) blows past it and
+    # kills the session with "failed to decode JSON message as it
+    # exceeded maximum buffer size". Worse with resume_last_session on:
+    # the saved session replays the same oversized message on every
+    # relaunch, so restarting never recovers it. Killed a live session
+    # on 2026-09-02. 32 MB is generous without being unbounded.
+    "max_buffer_size": 32 * 1024 * 1024,
     # Publish your Claude usage (the five-hour and weekly windows) on the
     # signal bus so a face can draw it. OFF by default and deliberately
     # so: this is your own account spend, and the faces this feeds are

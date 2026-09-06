@@ -142,11 +142,11 @@ class WarmBrain:
                 can_use_tool=self._can_use_tool,
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
-                resume=rid,
                 # SDK default is 1MB per stdout message; a single large
                 # tool result (log dump, full-file read) can exceed that
                 # and kill the reader task, hanging the whole session.
-                max_buffer_size=10 * 1024 * 1024,
+                max_buffer_size=CFG["max_buffer_size"],
+                resume=rid,
             )
         if resume:
             try:

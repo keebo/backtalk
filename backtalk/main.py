@@ -852,6 +852,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
             first = False
         else:
             log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
+            signals.transcript(NAME, s)
             batch.append(s)
             if len(batch) >= 2:
                 mouth.say_chunk(" ".join(batch), pending)
@@ -861,6 +862,10 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     try:
         async for sentence in brain.ask_stream(text):
             emit(sentence)
+        # Generation is done: no more sentences are coming, so the queue
+        # emptying from here on is the reply actually finishing, not a
+        # gap while the agent is still working on the next chunk.
+        signals.set_turn_active(False)
         if batch:
             mouth.say_chunk(" ".join(batch), pending)
             pending = []
@@ -877,6 +882,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         if mouth.nothing_queued():
             signals.set_state("idle")
     except asyncio.CancelledError:
+        signals.set_turn_active(False)
         try:
             await brain.interrupt()
         except Exception:
@@ -894,6 +900,12 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
 
 
 async def amain():
+    # Clear the face's transcript and activity panels before anything else
+    # runs. resume_last_session (below) reattaches the actual Claude
+    # conversation — the model remembers everything — but the screen
+    # starts clean on every launch regardless: what shows on load should
+    # be this session only, never a previous one's leftovers.
+    signals.clear_visual_history()
     open_mic = "--open-mic" in sys.argv
     barge_in = "--barge-in" in sys.argv
     model = None
@@ -1184,6 +1196,7 @@ async def amain():
         told apart from speech that began before the ask even existed."""
         nonlocal speak_task
         log(f"[you]    {text}")
+        signals.transcript("you", text)
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
         # began earlier is the user interrupting the turn, not
@@ -1255,6 +1268,7 @@ async def amain():
             await run_console(verb)
             return True
         signals.set_state("thinking")
+        signals.set_turn_active(True)
         signals.static_start()
         # Clean the pipe: drain the interrupted turn's leftovers so the
         # new question can't pair with a stale ResultMessage. A gate

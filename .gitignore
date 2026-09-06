@@ -22,3 +22,10 @@ show.json
 .python-version
 # Config backups the setup wizard leaves behind.
 *.json.*.bak
+
+# runtime signal-bus files written by the agent and the visualizer, never work
+.agent_note
+.agent_activity
+.backtalk_session
+.backtalk_session.*
+inbox/

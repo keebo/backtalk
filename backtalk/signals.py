@@ -63,6 +63,8 @@ _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _SOURCE_FILE = os.path.join(_DIR, ".voice_source")
+_TRANSCRIPT_FILE = os.path.join(_DIR, ".voice_transcript")
+_ACTIVITY_FILE = os.path.join(_DIR, ".agent_activity")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -78,6 +80,25 @@ _static_proc: subprocess.Popen | None = None
 # whether audio is already playing before adding the thinking sound on
 # top of it. Same binding pattern as mouth._turn_active/_turn_state.
 is_speaking = None
+
+# True from the moment a turn starts generating until brain.ask_stream has
+# yielded its last sentence. Set by main.py at the same points brain's own
+# turn_active property tracks internally — mouth.py's idle-vs-restore
+# decision now reads brain._turn_active/_turn_state directly instead of
+# this flag (a more precise signal, tied to the SDK's actual ResultMessage
+# lifecycle rather than an externally-toggled bool), so this pair is kept
+# only for main.py's existing call sites; nothing currently reads
+# turn_active() itself.
+_turn_active = False
+
+
+def set_turn_active(active: bool):
+    global _turn_active
+    _turn_active = bool(active)
+
+
+def turn_active() -> bool:
+    return _turn_active
 
 
 def set_state(name: str):
@@ -178,6 +199,61 @@ def reply_done():
         pass
 
 
+_TRANSCRIPT_MAX = 60
+
+
+def clear_visual_history():
+    """Empty the transcript captions and the activity feed on the face.
+
+    Called once at startup, before anything else, regardless of whether
+    resume_last_session reattaches the underlying Claude conversation —
+    the two are kept independent: the brain can remember everything, the
+    screen should only show this session. Both files are
+    written to a temp path and replaced, same as every other write on this
+    bus, so a face polling mid-write never reads a half-cleared file.
+    Never raises: a launch must not fail because a stale caption couldn't
+    be wiped."""
+    for path in (_TRANSCRIPT_FILE, _ACTIVITY_FILE):
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("[]")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+
+def transcript(role: str, text: str):
+    """Append one spoken line to the rolling conversation transcript.
+
+    Subtitles, and a scrollback for when the room was noisy or the
+    listener was not listening. `role` is "you" or the agent's name.
+
+    Kept to the last _TRANSCRIPT_MAX lines: this is a live caption track,
+    not a log. The real log is already in logs/backtalk.log. Written to a
+    temp file and replaced, so a face polling ~8x/sec can never read a
+    half-written file. Never raises."""
+    text = " ".join(str(text).split())
+    if not text:
+        return
+    try:
+        try:
+            with open(_TRANSCRIPT_FILE, encoding="utf-8") as f:
+                lines = json.load(f)
+            if not isinstance(lines, list):
+                lines = []
+        except (OSError, ValueError):
+            lines = []
+        lines.append({"ts": time.time(), "role": str(role), "text": text})
+        lines = lines[-_TRANSCRIPT_MAX:]
+        tmp = _TRANSCRIPT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(lines, f, ensure_ascii=False)
+        os.replace(tmp, _TRANSCRIPT_FILE)
+    except OSError:
+        pass
+
+
 _rate_limits: dict = {}
 
 
@@ -209,14 +285,23 @@ def set_rate_limit(window: str, utilization, resets_at):
 
 
 def _player_cmd(path: str) -> list[str] | None:
+    # 3 Sep 2026: the bundled assets/thinking.wav measures ~5% RMS (quiet)
+    # with repeated transient peaks at 80-89% of full scale in its first
+    # ~11 seconds — near-silence punctuated by sudden near-peak spikes,
+    # not evenly loud. The old -volume/-v levels below still put those
+    # spikes at roughly 30% of full digital scale, which read as a
+    # startling crack rather than a background cue (reported: "sounds
+    # like a flashbang"). Cut hard rather than nudged — a thinking sound
+    # that must be strained to hear is the safe failure mode; one that
+    # jumps out is not.
     if sys.platform == "darwin":
-        return ["afplay", "-v", "0.35", path]
+        return ["afplay", "-v", "0.12", path]
     for cand in ("ffplay", "aplay", "paplay"):
         from shutil import which
         if which(cand):
             if cand == "ffplay":
                 return ["ffplay", "-nodisp", "-autoexit", "-loglevel",
-                        "quiet", "-volume", "35", path]
+                        "quiet", "-volume", "12", path]
             return [cand, path]
     return None
 

@@ -664,9 +664,6 @@ class Mouth:
             finally:
                 if self._q.empty():
                     self._speaking.clear()
-                    # The reply has genuinely stopped talking, as opposed to
-                    # the gap between two sentences of the same reply.
-                    signals.reply_done()
                     self.ducker.speech_end()
                     # Only declare idle if the brain agrees the turn is
                     # actually over. Mid-turn (a tool call about to run,
@@ -676,6 +673,12 @@ class Mouth:
                     # which this same loop just wrote and which is stale
                     # the moment audio actually stops.
                     if self._turn_active is None or not self._turn_active():
+                        # The reply has genuinely stopped talking —
+                        # distinct from the state going idle between
+                        # sentences of the same reply, which anything
+                        # waiting for a fully-drained turn (the
+                        # transcript/activity panels) wants to know.
+                        signals.reply_done()
                         signals.set_state("idle")
                     elif self._turn_state is not None:
                         signals.set_state(self._turn_state())
