@@ -844,6 +844,12 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         if not s:
             return
         full_reply.append(s)
+        # Every sentence gets captioned, not just the ones after the
+        # first -- the first branch below used to skip this call
+        # entirely, silently dropping the opening sentence of every
+        # reply (and the whole thing, for a one-sentence reply) from
+        # the transcript panel.
+        signals.transcript(NAME, s)
         if first:
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
@@ -852,7 +858,6 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
             first = False
         else:
             log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
-            signals.transcript(NAME, s)
             batch.append(s)
             if len(batch) >= 2:
                 mouth.say_chunk(" ".join(batch), pending)
