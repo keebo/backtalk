@@ -29,13 +29,14 @@ import platform
 import re
 import sys
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
 import webrtcvad
 
 from backtalk.config import CFG
-from backtalk.vlog import log
+from backtalk.vlog import log, log_debug
 
 RATE = 16000
 FRAME_MS = 30
@@ -145,6 +146,129 @@ def _open_mic():
             except Exception:
                 pass                   # fall through to the rebuild below
         return _reopen_after_device_change(opts)
+
+
+# --------------------------- persistent capture ----------------------------
+# Round 2, 2026-09-06 -- round 1 (a1196ba) broke live capture after two
+# presses and was reverted. Two faithful standalone stress tests (a heavy
+# synchronous CPU load standing in for Whisper's model-load, and an
+# aggressively churning output stream standing in for mouth.py's real
+# underflow-driven reopen cycle) both came back completely clean -- zero
+# read failures -- pointing away from a bug in this thread design itself
+# and toward the reactor face's own GPU-heavy rendering (already a
+# documented cause of backtalk audio trouble today, independent of this
+# code) as the more likely real contributor. NOT CONFIRMED -- that theory
+# is why every transition below is logged instead of silent: if this
+# breaks again, backtalk.log should show exactly which stream open, which
+# read, and which frame count went wrong, rather than another guess.
+_mic_stream = None
+_mic_stream_dev = object()            # sentinel: never equals a real device
+_mic_thread = None
+_mic_thread_stop = threading.Event()
+_mic_capture_lock = threading.Lock()
+_mic_capturing = False
+_mic_capture_frames: list = []
+_mic_stream_error: Exception | None = None
+_mic_reads_ok = 0
+_mic_reads_failed = 0
+
+
+def _mic_drain_loop():
+    """Runs for the life of the process on its own thread. Keeps the
+    persistent stream current with the configured device (mirrors the
+    old per-open re-resolution in _mic_index, so a mic swap is still
+    picked up), reads continuously, and either banks or discards each
+    block depending on whether a press is in progress. A stream-level
+    failure is stashed for record_held() to raise, since this thread has
+    no caller of its own to hand it to."""
+    global _mic_stream, _mic_stream_dev, _mic_stream_error
+    global _mic_reads_ok, _mic_reads_failed
+    opts = dict(samplerate=RATE, channels=1, dtype="int16",
+                blocksize=FRAME_LEN)
+    last_heartbeat = time.monotonic()
+    while not _mic_thread_stop.is_set():
+        dev = _mic_index()
+        if _mic_stream is None or dev != _mic_stream_dev:
+            log(f"[ears] mic drain thread: (re)opening stream "
+                f"(dev={dev!r}, was={_mic_stream_dev!r})")
+            if _mic_stream is not None:
+                try:
+                    _mic_stream.stop()
+                    _mic_stream.close()
+                except Exception as close_e:
+                    log(f"[ears] mic drain thread: close-before-reopen "
+                        f"raised {close_e!r} (continuing anyway)")
+                _mic_stream = None
+            try:
+                s = sd.InputStream(device=dev, **opts)
+                s.start()
+                log("[ears] mic drain thread: stream open + started OK")
+            except Exception as e:
+                s = None
+                log(f"[ears] mic drain thread: open failed on dev={dev!r}: "
+                    f"{type(e).__name__}: {e}")
+                if dev is not None:
+                    try:
+                        s = sd.InputStream(**opts)
+                        s.start()
+                        log("[ears] mic drain thread: system-default "
+                            "fallback open OK")
+                    except Exception as e2:
+                        log(f"[ears] mic drain thread: system-default "
+                            f"fallback ALSO failed: {type(e2).__name__}: {e2}")
+                        s = None
+                if s is None:
+                    try:
+                        s = _reopen_after_device_change(opts)
+                        s.start()
+                        log("[ears] mic drain thread: rebuild-and-reopen OK")
+                    except Exception as e3:
+                        _mic_stream_error = e3
+                        log(f"[ears] mic drain thread: rebuild-and-reopen "
+                            f"ALSO failed: {type(e3).__name__}: {e3} -- "
+                            f"retrying in 0.5s")
+                        time.sleep(0.5)
+                        continue
+            _mic_stream, _mic_stream_dev = s, dev
+        try:
+            block, overflowed = _mic_stream.read(FRAME_LEN)
+            _mic_reads_ok += 1
+            if overflowed:
+                log_debug("[ears] mic drain thread: read() reported "
+                          "overflow=True (flag only, not an exception)")
+        except Exception as e:
+            _mic_reads_failed += 1
+            _mic_stream_error = e
+            log(f"[ears] mic drain thread: read() FAILED (#{_mic_reads_failed} "
+                f"total): {type(e).__name__}: {e} -- reopening")
+            try:
+                _mic_stream.stop()
+                _mic_stream.close()
+            except Exception as close_e:
+                log(f"[ears] mic drain thread: close-after-read-failure "
+                    f"raised {close_e!r}")
+            _mic_stream = None
+            continue
+        if _mic_capturing:
+            with _mic_capture_lock:
+                _mic_capture_frames.append(block[:, 0].copy())
+        now = time.monotonic()
+        if now - last_heartbeat > 30:
+            log_debug(f"[ears] mic drain thread heartbeat: reads_ok="
+                      f"{_mic_reads_ok} reads_failed={_mic_reads_failed} "
+                      f"capturing={_mic_capturing}")
+            last_heartbeat = now
+
+
+def _ensure_mic_thread():
+    """Idempotent: safe to call on every press, cheap after the first."""
+    global _mic_thread
+    if _mic_thread is None or not _mic_thread.is_alive():
+        log(f"[ears] starting mic drain thread (previous alive="
+            f"{_mic_thread.is_alive() if _mic_thread else None})")
+        _mic_thread_stop.clear()
+        _mic_thread = threading.Thread(target=_mic_drain_loop, daemon=True)
+        _mic_thread.start()
 
 
 def _reopen_after_device_change(opts):
@@ -275,6 +399,10 @@ def warm():
     utterance doesn't pay the load."""
     global _model, _backend
     check_microphone()
+    # Starts the persistent mic stream now, during warm-up, so the FIRST
+    # real press of the session also gets a stream that's already been
+    # running rather than paying the one-time open/start cost itself.
+    _ensure_mic_thread()
     with _model_lock:
         if _model is None:
             if _apple_gpu_available():
@@ -404,18 +532,45 @@ class Ears:
 
 
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
-    """Hold-to-talk capture: record raw audio while is_held() is True,
-    then transcribe. The button is the VAD — no endpointing. Returns
-    None for taps shorter than min_s (accidental presses)."""
-    frames: list[np.ndarray] = []
-    with _open_mic() as stream:
-        while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
-            block, _ = stream.read(FRAME_LEN)
-            frames.append(block[:, 0].copy())
-        # a small tail so the last word isn't clipped at release
-        for _ in range(6):
-            block, _ = stream.read(FRAME_LEN)
-            frames.append(block[:, 0].copy())
+    """Hold-to-talk capture: bank real-time audio from the persistent mic
+    thread (see _mic_drain_loop) while is_held() is True, then
+    transcribe. The button is the VAD — no endpointing. Returns None for
+    taps shorter than min_s (accidental presses).
+
+    _ensure_mic_thread() here is normally a no-op -- warm() already
+    started it -- but stays as a safety net for the case backtalk's
+    startup somehow skipped that, so a press still works rather than
+    capturing nothing from a thread that was never running.
+
+    Every press logs its own outcome (held time, samples banked, read
+    ok/fail delta) -- round 1 of this design broke live with nothing in
+    the log to show why; this is the fix for THAT, independent of
+    whether the capture bug itself recurs."""
+    global _mic_capturing, _mic_capture_frames, _mic_stream_error
+    _ensure_mic_thread()
+    _mic_stream_error = None
+    before_ok, before_failed = _mic_reads_ok, _mic_reads_failed
+    with _mic_capture_lock:
+        _mic_capture_frames = []
+        _mic_capturing = True
+    start = time.monotonic()
+    while is_held() and time.monotonic() - start < max_s:
+        time.sleep(0.01)
+    # a small tail so the last word isn't clipped at release
+    time.sleep(6 * FRAME_MS / 1000)
+    with _mic_capture_lock:
+        _mic_capturing = False
+        frames = _mic_capture_frames
+        _mic_capture_frames = []
+    held_s = time.monotonic() - start
+    n_samples = sum(len(f) for f in frames)
+    log(f"[ears] record_held: held {held_s:.2f}s, banked {n_samples} "
+        f"samples ({n_samples/RATE:.2f}s), reads ok +"
+        f"{_mic_reads_ok - before_ok} failed +{_mic_reads_failed - before_failed}, "
+        f"pending_error={_mic_stream_error!r}")
+    if _mic_stream_error is not None:
+        err, _mic_stream_error = _mic_stream_error, None
+        raise err
     if len(frames) * FRAME_MS / 1000 < min_s:
         return None
     return transcribe(np.concatenate(frames))
