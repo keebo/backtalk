@@ -67,6 +67,8 @@ _TRANSCRIPT_FILE = os.path.join(_DIR, ".voice_transcript")
 _ACTIVITY_FILE = os.path.join(_DIR, ".agent_activity")
 _THINKING_VOLUME_FILE = os.path.join(_DIR, ".thinking_volume")
 _VOICE_VOLUME_FILE = os.path.join(_DIR, ".voice_volume")
+_SILENT_MODE_FILE = os.path.join(_DIR, ".silent_mode")
+_TYPED_INPUT_FILE = os.path.join(_DIR, ".typed_input")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -306,6 +308,39 @@ def get_voice_volume() -> float:
     return _read_volume(_VOICE_VOLUME_FILE, 1.0)
 
 
+def is_silent_mode() -> bool:
+    """A face's toggle (ai-visualizer's /mode endpoint) writes here.
+    Silent mode: no TTS, no thinking cue, no push-to-talk -- typed
+    input via .typed_input replaces all three. Never raises; a missing
+    or malformed file just means voice mode, the normal default."""
+    try:
+        with open(_SILENT_MODE_FILE) as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def get_typed_input() -> str | None:
+    """One pending typed message from a face's chat box (ai-visualizer's
+    /type endpoint), or None. Read-and-clear: the file is emptied the
+    instant it's read so the same line is never picked up twice. Not
+    a queue -- Kevin submits one message, waits for the reply, submits
+    the next, same shape as a spoken turn."""
+    try:
+        with open(_TYPED_INPUT_FILE) as f:
+            text = f.read().strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        with open(_TYPED_INPUT_FILE, "w"):
+            pass
+    except OSError:
+        pass
+    return text
+
+
 def _player_cmd(path: str) -> list[str] | None:
     # 3 Sep 2026: the bundled assets/thinking.wav measures ~5% RMS (quiet)
     # with repeated transient peaks at 80-89% of full scale in its first
@@ -341,6 +376,8 @@ def static_start():
     would play right over live speech until that boundary arrives."""
     global _static_proc
     if not _THINKING_SOUND or not os.path.exists(_THINKING_SOUND):
+        return
+    if is_silent_mode():
         return
     if is_speaking is not None and is_speaking():
         return

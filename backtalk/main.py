@@ -626,6 +626,19 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
+def _browser_typed_reader(q: "queue.Queue[str]"):
+    """Silent mode's chat box (ai-visualizer's /type endpoint) -> typed
+    messages (daemon thread), feeding the SAME queue _typed_reader does
+    for terminal typing. A submitted line is a first-class turn either
+    way -- same pipeline as a spoken utterance, just captioned instead
+    of spoken (mouth.py refuses to enqueue any audio while silent)."""
+    while True:
+        text = signals.get_typed_input()
+        if text:
+            q.put(text)
+        time.sleep(0.25)
+
+
 async def speak_reply_local(mouth: Mouth, text: str) -> bool:
     """Answers entirely with the local model — no Claude turn at all,
     so zero tokens spent. Returns True once spoken; False if local
@@ -671,6 +684,11 @@ async def speak_reply_local(mouth: Mouth, text: str) -> bool:
     else:
         _ROUTER_STATE["pending_forward"] = None
         _ROUTER_STATE["awaiting_answer"] = router.is_awaiting_answer(reply)
+    # Written unconditionally, same as the cloud path's emit() -- found
+    # 2026-09-06 while wiring silent mode that Rosa's replies never
+    # reached the transcript at all, which would make silent mode go
+    # completely dark for any locally-routed question.
+    signals.transcript(local_name, reply)
     mouth.say(reply, voice=CFG.get("local_llm", {}).get("voice") or None)
     signals.static_stop()
     if mouth.nothing_queued():
@@ -728,8 +746,10 @@ async def speak_reply_proofread(mouth: Mouth, text: str) -> bool:
     log(f"[{local_name}] (edit, {time.time() - t0:.1f}s) saved to {out_path}")
     _ROUTER_STATE["awaiting_answer"] = False
     signals.static_stop()
-    mouth.say(f"Done — saved the edited version to your {local_name} "
-              "folder.", voice=CFG.get("local_llm", {}).get("voice") or None)
+    confirmation = (f"Done — saved the edited version to your {local_name} "
+                    "folder.")
+    signals.transcript(local_name, confirmation)
+    mouth.say(confirmation, voice=CFG.get("local_llm", {}).get("voice") or None)
     if mouth.nothing_queued():
         signals.set_state("idle")
     return True
@@ -1056,6 +1076,7 @@ async def amain():
     speak_task: asyncio.Task | None = None
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
+    threading.Thread(target=_browser_typed_reader, args=(typed_q,), daemon=True).start()
     typed_fut: asyncio.Future | None = None
 
     async def run_console(verb):
@@ -1377,6 +1398,13 @@ async def amain():
                 continue
             if press_fut in done:
                 press_fut.result(); press_fut = None
+                if signals.is_silent_mode():
+                    # Silent mode: typed input replaces the button
+                    # entirely. The key hook keeps running (so nothing
+                    # breaks flipping back to voice mode mid-press), it
+                    # just does nothing while silent.
+                    log("[ptt] press ignored — silent mode is on")
+                    continue
                 press_t = time.monotonic()
                 perm_wait = (_PERM["fut"] is not None
                              and not _PERM["fut"].done())

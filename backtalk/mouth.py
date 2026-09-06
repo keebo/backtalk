@@ -607,6 +607,9 @@ class Mouth:
         """Queue text (split to sentences) for speech. `voice` overrides
         the configured voice for every sentence in this call — used for
         the local LLM's replies."""
+        from backtalk import signals
+        if signals.is_silent_mode():
+            return
         for s in split_sentences(text):
             self._q.put((s, None, voice))
 
@@ -617,7 +620,15 @@ class Mouth:
 
         `directions` are the stage directions this chunk carried. They are
         published on the signal bus when this chunk's audio STARTS, which
-        is why they travel with it instead of firing at parse time."""
+        is why they travel with it instead of firing at parse time.
+
+        Silent mode: nothing is ever enqueued here, so nothing plays --
+        callers already write the transcript separately (signals.transcript
+        in main.py's emit()), so the reply still shows up there, just
+        never spoken."""
+        from backtalk import signals
+        if signals.is_silent_mode():
+            return
         text = text.strip()
         if text:
             self._q.put((text, directions or None, voice))
