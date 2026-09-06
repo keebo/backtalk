@@ -773,6 +773,19 @@ class Mouth:
 
             def _write(pcm):
                 nonlocal out
+                # A face's own slider (ai-visualizer's /volume endpoint)
+                # writes here; 1.0 (unity, no change) is the default so a
+                # session that never touches the slider behaves exactly
+                # as before this existed. Applied once per chunk, not per
+                # block below, since it's the same value either way and
+                # this is cheaper. Capped at 1.0 by signals.get_voice_volume
+                # itself -- this is a real digital gain on int16 samples,
+                # so anything above unity risks clipping distortion rather
+                # than just getting louder.
+                vol = signals.get_voice_volume()
+                if vol != 1.0 and len(pcm) > 0:
+                    pcm = np.clip(pcm.astype(np.float32) * vol,
+                                  -32768, 32767).astype(np.int16)
                 # Diagnostic added 2026-09-03: hours of dead-silent
                 # replies tonight left NO signal anywhere in this file --
                 # no underflow (write() never reported starvation), no

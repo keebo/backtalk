@@ -65,6 +65,8 @@ _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _SOURCE_FILE = os.path.join(_DIR, ".voice_source")
 _TRANSCRIPT_FILE = os.path.join(_DIR, ".voice_transcript")
 _ACTIVITY_FILE = os.path.join(_DIR, ".agent_activity")
+_THINKING_VOLUME_FILE = os.path.join(_DIR, ".thinking_volume")
+_VOICE_VOLUME_FILE = os.path.join(_DIR, ".voice_volume")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -284,24 +286,47 @@ def set_rate_limit(window: str, utilization, resets_at):
         pass
 
 
+def _read_volume(path: str, default: float) -> float:
+    """A face's own slider writes here via ai-visualizer's /volume
+    endpoint (server.py); this is the only channel back to backtalk,
+    which has no HTTP server of its own. Never raises -- a missing or
+    malformed file just means nobody's touched the slider yet."""
+    try:
+        with open(path) as f:
+            return min(1.0, max(0.0, float(f.read().strip())))
+    except (OSError, ValueError):
+        return default
+
+
+def get_thinking_volume() -> float:
+    return _read_volume(_THINKING_VOLUME_FILE, 0.35)
+
+
+def get_voice_volume() -> float:
+    return _read_volume(_VOICE_VOLUME_FILE, 1.0)
+
+
 def _player_cmd(path: str) -> list[str] | None:
     # 3 Sep 2026: the bundled assets/thinking.wav measures ~5% RMS (quiet)
     # with repeated transient peaks at 80-89% of full scale in its first
     # ~11 seconds — near-silence punctuated by sudden near-peak spikes,
-    # not evenly loud. The old -volume/-v levels below still put those
-    # spikes at roughly 30% of full digital scale, which read as a
-    # startling crack rather than a background cue (reported: "sounds
-    # like a flashbang"). Cut hard rather than nudged — a thinking sound
-    # that must be strained to hear is the safe failure mode; one that
-    # jumps out is not.
+    # not evenly loud. A GunnarTech fork commit cut this to 0.12 the same
+    # day it was merged in here, reporting the spikes at the prior level
+    # read as a startling crack ("sounds like a flashbang") rather than a
+    # background cue. Kevin found 0.12 too quiet in practice and asked to
+    # revert to the original level, 6 Sep 2026 — his call on the
+    # loud-vs-startling tradeoff, not reverting the finding above. Now
+    # live-adjustable from a face's own slider instead of a fixed value
+    # either way -- get_thinking_volume() reads whatever was last set.
+    vol = get_thinking_volume()
     if sys.platform == "darwin":
-        return ["afplay", "-v", "0.12", path]
+        return ["afplay", "-v", f"{vol:.3f}", path]
     for cand in ("ffplay", "aplay", "paplay"):
         from shutil import which
         if which(cand):
             if cand == "ffplay":
                 return ["ffplay", "-nodisp", "-autoexit", "-loglevel",
-                        "quiet", "-volume", "12", path]
+                        "quiet", "-volume", str(round(vol * 100)), path]
             return [cand, path]
     return None
 
