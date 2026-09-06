@@ -354,9 +354,10 @@ def close_visualizer_tab():
 
     If ai-visualizer.json sets "open_app" (a standalone .app -- e.g. a
     Safari "Add to Dock" web app -- that server.py launches instead of a
-    browser tab, see ai-visualizer/server.py's open_visualizer()), quit
-    that app too. It's a separate application, not a Safari/Chrome tab,
-    so the URL-matching tab-close below can never reach it."""
+    browser tab, see ai-visualizer/server.py's open_visualizer() -- or a
+    list of them, when more than one face has its own pinned app), quit
+    all of them too. They're separate applications, not Safari/Chrome
+    tabs, so the URL-matching tab-close below can never reach them."""
     if sys.platform != "darwin":
         return
     port = 8790
@@ -402,11 +403,13 @@ def close_visualizer_tab():
         ''',
     ]
     if open_app:
-        scripts.append(f'''
-        if application "{open_app}" is running then
-            tell application "{open_app}" to quit
-        end if
-        ''')
+        apps = open_app if isinstance(open_app, list) else [open_app]
+        for app in apps:
+            scripts.append(f'''
+            if application "{app}" is running then
+                tell application "{app}" to quit
+            end if
+            ''')
     for script in scripts:
         try:
             subprocess.run(["osascript", "-e", script],
