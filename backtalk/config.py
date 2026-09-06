@@ -54,6 +54,10 @@ DEFAULTS = {
     # lasts one session and is always spoken; this default never moves
     # by itself.
     "deep_model": "claude-opus-5",
+    # Same pattern as deep_model, for the voice console's "switch to
+    # fable" command ("back to the fast model" also returns from here).
+    # Full id ON PURPOSE, same reasoning as "model".
+    "fable_model": "claude-fable-5",
     # Tool permissions for the voice session. "ask" is the default ON
     # PURPOSE (safety is opt-out, never opt-in): when the agent wants a
     # gated tool (write a file, run a real command), it ASKS OUT LOUD
@@ -342,8 +346,9 @@ DISCIPLINE = (
     "asking for permission' (then 'confirm'), or 'start asking "
     "again'. Microphone: 'go hands free', or 'push to talk mode'. "
     "Also: 'clear the session', 'compact the session', 'switch to "
-    "the deep model', 'back to the fast model', 'set effort to low' "
-    "(or medium, high, max), and 'usage report'. You cannot flip "
+    "the deep model', 'switch to fable', 'back to the fast model', "
+    "'set effort to low' (or medium, high, max), and 'usage report'. "
+    "You cannot flip "
     "these live yourself, so when asked, give the person the exact "
     "phrase to SAY. Editing backtalk.json only changes the default "
     "for the NEXT launch."

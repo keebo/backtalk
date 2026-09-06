@@ -27,11 +27,12 @@ spoken reply, and typing while it talks interrupts it.
 
 THE VOICE CONSOLE: exact phrases, spoken (or typed) alone, control the
 session itself so you never go back to the keyboard: "clear the
-session" / "compact the session" / "switch to the deep model" / "back
-to the fast model" / "set effort to low" (or medium, high, max) /
-"usage report" / "go hands free" and "push to talk mode" (the MIC) /
-"stop asking for permission" and "start asking again" (permissions,
-called auto-approve, a different axis than the microphone on purpose).
+session" / "compact the session" / "switch to the deep model" / "switch
+to fable" / "back to the fast model" / "set effort to low" (or medium,
+high, max) / "usage report" / "go hands free" and "push to talk mode"
+(the MIC) / "stop asking for permission" and "start asking again"
+(permissions, called auto-approve, a different axis than the
+microphone on purpose).
 And with permission_mode "ask" (the default), gated tool calls ASK OUT
 LOUD and your spoken yes or no decides them; any other answer is
 passed back to the agent as the reason.
@@ -349,6 +350,8 @@ CONSOLE_VERBS = {
                   "compact context", "slash compact"),
     "deep":      ("switch to the deep model", "use the deep model",
                   "slash model deep"),
+    "fable":     ("switch to fable", "switch to the fable model",
+                  "use fable", "use the fable model", "slash model fable"),
     "fast":      ("switch to the fast model", "use the fast model",
                   "back to the fast model", "slash model fast"),
     "usage":     ("usage report", "slash usage"),
@@ -1091,6 +1094,11 @@ async def amain():
                       "you're done.")
             resp = await brain.command(f"/model {CFG['deep_model']}")
             say_after = "Deep model online, for this session only."
+        elif verb == "fable":
+            mouth.say("Switching to Fable. Say back to the fast model "
+                      "when you're done.")
+            resp = await brain.command(f"/model {CFG['fable_model']}")
+            say_after = "Fable online, for this session only."
         elif verb == "fast":
             resp = await brain.command(f"/model {CFG['model']}")
             say_after = "Back on the fast model."
