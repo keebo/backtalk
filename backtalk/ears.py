@@ -29,7 +29,6 @@ import platform
 import re
 import sys
 import threading
-import time
 
 import numpy as np
 import sounddevice as sd
@@ -146,98 +145,6 @@ def _open_mic():
             except Exception:
                 pass                   # fall through to the rebuild below
         return _reopen_after_device_change(opts)
-
-
-# --------------------------- persistent capture ----------------------------
-# One mic stream, opened once and kept running for the life of the process,
-# drained continuously by a background thread -- instead of the old
-# open-on-press/close-on-release cycle. Real PortAudio stream-open latency
-# used to fall inside every single press: speaking the instant the key went
-# down could race that startup window and lose the first word (Kevin
-# reported "Cipher" itself dropping, 2026-09-06). A/B tested by ear before
-# building this: holding this stream open continuously does NOT audibly
-# duck backtalk's own thinking-cue or TTS output. That's not a given --
-# a BROWSER holding getUserMedia open does duck other apps' system-wide,
-# a documented echo-prevention behavior for communications-style mic
-# capture -- but a plain PortAudio input unit in the same process turned
-# out not to trigger it. Confirmed, not assumed, before relying on it here.
-_mic_stream = None
-_mic_stream_dev = object()            # sentinel: never equals a real device
-_mic_thread = None
-_mic_thread_stop = threading.Event()
-_mic_capture_lock = threading.Lock()
-_mic_capturing = False
-_mic_capture_frames: list = []
-_mic_stream_error: Exception | None = None
-
-
-def _mic_drain_loop():
-    """Runs for the life of the process on its own thread. Keeps the
-    persistent stream current with the configured device (mirrors the
-    old per-open re-resolution in _mic_index, so a mic swap is still
-    picked up), reads continuously, and either banks or discards each
-    block depending on whether a press is in progress. A stream-level
-    failure is stashed for record_held() to raise, since this thread has
-    no caller of its own to hand it to."""
-    global _mic_stream, _mic_stream_dev, _mic_stream_error
-    opts = dict(samplerate=RATE, channels=1, dtype="int16",
-                blocksize=FRAME_LEN)
-    while not _mic_thread_stop.is_set():
-        dev = _mic_index()
-        if _mic_stream is None or dev != _mic_stream_dev:
-            if _mic_stream is not None:
-                try:
-                    _mic_stream.stop()
-                    _mic_stream.close()
-                except Exception:
-                    pass
-                _mic_stream = None
-            try:
-                s = sd.InputStream(device=dev, **opts)
-                s.start()
-            except Exception as e:
-                s = None
-                if dev is not None:
-                    log(f"[ears] could not open mic_device "
-                        f"{CFG.get('mic_device')!r} ({e}) -- using the "
-                        f"system default")
-                    try:
-                        s = sd.InputStream(**opts)
-                        s.start()
-                    except Exception:
-                        s = None
-                if s is None:
-                    try:
-                        s = _reopen_after_device_change(opts)
-                        s.start()
-                    except Exception as e2:
-                        _mic_stream_error = e2
-                        time.sleep(0.5)
-                        continue
-            _mic_stream, _mic_stream_dev = s, dev
-        try:
-            block, _ = _mic_stream.read(FRAME_LEN)
-        except Exception as e:
-            _mic_stream_error = e
-            try:
-                _mic_stream.stop()
-                _mic_stream.close()
-            except Exception:
-                pass
-            _mic_stream = None
-            continue
-        if _mic_capturing:
-            with _mic_capture_lock:
-                _mic_capture_frames.append(block[:, 0].copy())
-
-
-def _ensure_mic_thread():
-    """Idempotent: safe to call on every press, cheap after the first."""
-    global _mic_thread
-    if _mic_thread is None or not _mic_thread.is_alive():
-        _mic_thread_stop.clear()
-        _mic_thread = threading.Thread(target=_mic_drain_loop, daemon=True)
-        _mic_thread.start()
 
 
 def _reopen_after_device_change(opts):
@@ -368,10 +275,6 @@ def warm():
     utterance doesn't pay the load."""
     global _model, _backend
     check_microphone()
-    # Starts the persistent mic stream now, during warm-up, so the FIRST
-    # real press of the session also gets a stream that's already been
-    # running rather than paying the one-time open/start cost itself.
-    _ensure_mic_thread()
     with _model_lock:
         if _model is None:
             if _apple_gpu_available():
@@ -501,33 +404,18 @@ class Ears:
 
 
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
-    """Hold-to-talk capture: bank real-time audio from the persistent mic
-    thread (see _mic_drain_loop) while is_held() is True, then
-    transcribe. The button is the VAD — no endpointing. Returns None for
-    taps shorter than min_s (accidental presses).
-
-    _ensure_mic_thread() here is normally a no-op -- warm() already
-    started it -- but stays as a safety net for the case backtalk's
-    startup somehow skipped that, so a press still works rather than
-    capturing nothing from a thread that was never running."""
-    global _mic_capturing, _mic_capture_frames, _mic_stream_error
-    _ensure_mic_thread()
-    _mic_stream_error = None
-    with _mic_capture_lock:
-        _mic_capture_frames = []
-        _mic_capturing = True
-    start = time.monotonic()
-    while is_held() and time.monotonic() - start < max_s:
-        time.sleep(0.01)
-    # a small tail so the last word isn't clipped at release
-    time.sleep(6 * FRAME_MS / 1000)
-    with _mic_capture_lock:
-        _mic_capturing = False
-        frames = _mic_capture_frames
-        _mic_capture_frames = []
-    if _mic_stream_error is not None:
-        err, _mic_stream_error = _mic_stream_error, None
-        raise err
+    """Hold-to-talk capture: record raw audio while is_held() is True,
+    then transcribe. The button is the VAD — no endpointing. Returns
+    None for taps shorter than min_s (accidental presses)."""
+    frames: list[np.ndarray] = []
+    with _open_mic() as stream:
+        while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
+            block, _ = stream.read(FRAME_LEN)
+            frames.append(block[:, 0].copy())
+        # a small tail so the last word isn't clipped at release
+        for _ in range(6):
+            block, _ = stream.read(FRAME_LEN)
+            frames.append(block[:, 0].copy())
     if len(frames) * FRAME_MS / 1000 < min_s:
         return None
     return transcribe(np.concatenate(frames))
