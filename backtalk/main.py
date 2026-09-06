@@ -1053,6 +1053,13 @@ async def amain():
     async def _run_console_inner(verb):
         _deny_pending()
         await brain.reset_turn()
+        # Console verbs (compact, clear, model switch, effort) are always
+        # handled by the main cloud agent, never Rosa -- but the stream
+        # loop that drives the face's thinking/working state has no idea
+        # who's asking, so without this the source tag left over from
+        # whatever answered the LAST real turn (possibly "local") bleeds
+        # into these commands and mislabels the face as Rosa.
+        signals.set_source("cloud")
         say_after = None
         if verb == "clear":
             resp = await brain.command("/clear")
