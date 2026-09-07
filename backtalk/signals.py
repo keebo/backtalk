@@ -69,6 +69,7 @@ _THINKING_VOLUME_FILE = os.path.join(_DIR, ".thinking_volume")
 _VOICE_VOLUME_FILE = os.path.join(_DIR, ".voice_volume")
 _SILENT_MODE_FILE = os.path.join(_DIR, ".silent_mode")
 _TYPED_INPUT_FILE = os.path.join(_DIR, ".typed_input")
+_MODEL_FILE = os.path.join(_DIR, ".voice_model")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -306,6 +307,21 @@ def get_thinking_volume() -> float:
 
 def get_voice_volume() -> float:
     return _read_volume(_VOICE_VOLUME_FILE, 1.0)
+
+
+def set_model(tier: str):
+    """Which model tier is live -- "fast", "deep", or "fable". Written at
+    startup and on every voice-console model switch, so a face's model
+    selector can show the real current state instead of guessing.
+    KNOWN GAP: a raw slash-command switch typed straight to the SDK
+    (e.g. "/model claude-fable-5" in the terminal) bypasses the console
+    verbs and so never lands here -- the selector shows the last
+    console-driven state until the next real switch. Never raises."""
+    try:
+        with open(_MODEL_FILE, "w") as f:
+            f.write(tier)
+    except OSError:
+        pass
 
 
 def is_silent_mode() -> bool:

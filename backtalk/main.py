@@ -1072,6 +1072,10 @@ async def amain():
         log(f"[backtalk] effort set to {boot_effort} (from config)")
     elif boot_effort:
         log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
+    # Every session boots on CFG["model"] (the fast tier); publish that
+    # so a face's model selector starts correct instead of stale from
+    # the previous session's last switch.
+    signals.set_model("fast")
 
     speak_task: asyncio.Task | None = None
     typed_q: "queue.Queue[str]" = queue.Queue()
@@ -1114,14 +1118,17 @@ async def amain():
                       "get slower. Say back to the fast model when "
                       "you're done.")
             resp = await brain.command(f"/model {CFG['deep_model']}")
+            signals.set_model("deep")
             say_after = "Deep model online, for this session only."
         elif verb == "fable":
             mouth.say("Switching to Fable. Say back to the fast model "
                       "when you're done.")
             resp = await brain.command(f"/model {CFG['fable_model']}")
+            signals.set_model("fable")
             say_after = "Fable online, for this session only."
         elif verb == "fast":
             resp = await brain.command(f"/model {CFG['model']}")
+            signals.set_model("fast")
             say_after = "Back on the fast model."
         elif verb.startswith("effort:"):
             lvl = verb.split(":", 1)[1]
