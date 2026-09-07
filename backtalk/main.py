@@ -28,7 +28,7 @@ spoken reply, and typing while it talks interrupts it.
 THE VOICE CONSOLE: exact phrases, spoken (or typed) alone, control the
 session itself so you never go back to the keyboard: "clear the
 session" / "compact the session" / "switch to the deep model" / "switch
-to fable" / "back to the fast model" / "set effort to low" (or medium,
+to fable" / "switch to haiku" / "back to the fast model" / "set effort to low" (or medium,
 high, max) / "usage report" / "go hands free" and "push to talk mode"
 (the MIC) / "stop asking for permission" and "start asking again"
 (permissions, called auto-approve, a different axis than the
@@ -352,6 +352,8 @@ CONSOLE_VERBS = {
                   "slash model deep"),
     "fable":     ("switch to fable", "switch to the fable model",
                   "use fable", "use the fable model", "slash model fable"),
+    "haiku":     ("switch to haiku", "switch to the haiku model",
+                  "use haiku", "use the haiku model", "slash model haiku"),
     "fast":      ("switch to the fast model", "use the fast model",
                   "back to the fast model", "slash model fast"),
     "usage":     ("usage report", "slash usage"),
@@ -1126,6 +1128,12 @@ async def amain():
             resp = await brain.command(f"/model {CFG['fable_model']}")
             signals.set_model("fable")
             say_after = "Fable online, for this session only."
+        elif verb == "haiku":
+            mouth.say("Switching to Haiku. Say back to the fast model "
+                      "when you're done.")
+            resp = await brain.command(f"/model {CFG['haiku_model']}")
+            signals.set_model("haiku")
+            say_after = "Haiku online, for this session only."
         elif verb == "fast":
             resp = await brain.command(f"/model {CFG['model']}")
             signals.set_model("fast")

@@ -58,6 +58,9 @@ DEFAULTS = {
     # fable" command ("back to the fast model" also returns from here).
     # Full id ON PURPOSE, same reasoning as "model".
     "fable_model": "claude-fable-5",
+    # Same pattern again, for "switch to haiku" -- the fast, low-cost
+    # tier, distinct from "model" (Sonnet, the default fast tier).
+    "haiku_model": "claude-haiku-4-5-20251001",
     # Tool permissions for the voice session. "ask" is the default ON
     # PURPOSE (safety is opt-out, never opt-in): when the agent wants a
     # gated tool (write a file, run a real command), it ASKS OUT LOUD
@@ -346,8 +349,9 @@ DISCIPLINE = (
     "asking for permission' (then 'confirm'), or 'start asking "
     "again'. Microphone: 'go hands free', or 'push to talk mode'. "
     "Also: 'clear the session', 'compact the session', 'switch to "
-    "the deep model', 'switch to fable', 'back to the fast model', "
-    "'set effort to low' (or medium, high, max), and 'usage report'. "
+    "the deep model', 'switch to fable', 'switch to haiku', 'back to "
+    "the fast model', 'set effort to low' (or medium, high, max), and "
+    "'usage report'. "
     "You cannot flip "
     "these live yourself, so when asked, give the person the exact "
     "phrase to SAY. Editing backtalk.json only changes the default "
