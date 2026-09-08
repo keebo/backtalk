@@ -233,6 +233,22 @@ DEFAULTS = {
         "enabled": False,
         "model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
         "max_tokens": 200,
+        # mlx_lm.generate() defaults to greedy decoding with zero
+        # repetition guard when no sampler/logits_processors are passed
+        # — fine for a short 1-3 sentence spoken answer, a real
+        # liability on longer structured output. Confirmed live
+        # 2026-09-08: a proofread job's "summary of changes" list got
+        # stuck alternating the same two entries five times each
+        # instead of continuing — a textbook greedy-decoding repetition
+        # loop, not a one-off fluke. Applied globally in _generate_raw
+        # via make_logits_processors, not just on the edit/job paths,
+        # since any long enough generate() call can hit the same loop.
+        "repetition_penalty": 1.15,
+        # Wide enough to span a whole repeated multi-sentence block
+        # (the observed loop repeated a ~70-90 token chunk); mlx_lm's
+        # default of 20 only looks back far enough to catch short
+        # word-level loops, not this shape of bug.
+        "repetition_context_size": 400,
         # Proofread/tone-edit mode's own budget — the output is meant
         # to be as long as the input paragraph(s), unlike the short
         # spoken-answer default above. Kevin's ask, 2026-08-31.

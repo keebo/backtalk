@@ -133,6 +133,7 @@ def warm():
 def _generate_raw(model, tokenizer, text: str, system: str | None = None,
                    max_tokens: int | None = None) -> str:
     from mlx_lm import generate as _mlx_generate
+    from mlx_lm.sample_utils import make_logits_processors
 
     # A caller-supplied system prompt (edit mode) opts out of the
     # default Q&A framing entirely — date/math annotation only makes
@@ -153,8 +154,13 @@ def _generate_raw(model, tokenizer, text: str, system: str | None = None,
         add_generation_prompt=True, tokenize=False)
     if max_tokens is None:
         max_tokens = CFG.get("local_llm", {}).get("max_tokens", 200)
+    cfg = CFG.get("local_llm", {})
+    logits_processors = make_logits_processors(
+        repetition_penalty=cfg.get("repetition_penalty", 1.15),
+        repetition_context_size=cfg.get("repetition_context_size", 400))
     out = _mlx_generate(model, tokenizer, prompt=prompt,
-                        max_tokens=max_tokens, verbose=False)
+                        max_tokens=max_tokens, verbose=False,
+                        logits_processors=logits_processors)
     return out.strip()
 
 
