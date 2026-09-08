@@ -641,6 +641,85 @@ def _browser_typed_reader(q: "queue.Queue[str]"):
         time.sleep(0.25)
 
 
+# Raised 2026-09-07 after Kevin's real first job (a 12,693-char HTML
+# deck) tripped the original 12,000 cap, which turned out to be an
+# overly conservative guess sized against edit_max_tokens (1200, the
+# OUTPUT budget) rather than checked against Rosa's actual INPUT
+# capacity. Confirmed directly: mlx_lm's loaded ModelArgs reports
+# max_position_embeddings=32768 for Qwen2.5-7B-Instruct-4bit -- 40,000
+# chars leaves comfortable headroom under that real ceiling (prompt +
+# system text + the 1200-token output all have to fit inside it) while
+# staying well clear of the point where a quantized 7B model's
+# summarization quality would start to degrade on an overlong context.
+ROSA_QUEUE_MAX_CHARS = 40000
+
+
+def _rosa_queue_loop():
+    """Drains the Rosa job queue (ai-visualizer's /rosa_submit writes to
+    it; the reactor face's queue/outbox pop-outs poll it) -- Kevin's ask
+    2026-09-07: hand Rosa a specific file or pasted text plus an
+    instruction from the face itself, no live conversation turn needed.
+
+    Runs as its own daemon thread, independent of any live turn, since
+    MLX generation is blocking work anyway and this has nothing to do
+    with the async event loop driving actual conversation. One job at a
+    time, oldest pending first -- local_llm's model/lock is a single
+    shared instance, so there is no real parallelism to gain by doing
+    otherwise, only contention to avoid.
+
+    Same boundary as every other Rosa feature: THIS function (deterministic
+    backtalk code) does every file read and write. Rosa never touches the
+    filesystem herself -- delegate() just gets a prompt string, same as
+    when Cipher calls it directly via scripts/rosa_ask.py. Kevin building
+    a UI that hands her jobs directly, bypassing Cipher, is a deliberate
+    expansion of delegate()'s original "Cipher decides it's self-contained"
+    framing -- Kevin's own call to make for his own tool.
+
+    KNOWN LIMITATION: only runs while backtalk itself is running -- there
+    is no separate watcher process, so a job submitted while backtalk is
+    down just waits in the queue until the next launch."""
+    from pathlib import Path
+
+    from backtalk import local_llm
+
+    while True:
+        try:
+            jobs = signals.rosa_read_queue()
+            job = next((j for j in jobs if j.get("status") == "pending"), None)
+            if job is None:
+                time.sleep(2.0)
+                continue
+            job["status"] = "running"
+            signals.rosa_write_queue(jobs)
+            try:
+                if job.get("file_path"):
+                    content = Path(job["file_path"]).expanduser().read_text(
+                        encoding="utf-8", errors="replace")
+                else:
+                    content = job.get("text") or ""
+                if len(content) > ROSA_QUEUE_MAX_CHARS:
+                    raise ValueError(
+                        f"input is {len(content)} chars, over the "
+                        f"{ROSA_QUEUE_MAX_CHARS}-char cap for a single job")
+                prompt = f"{job['instruction']}\n\n{content}"
+                result = local_llm.delegate(prompt)
+                out_dir = Path(CFG.get("local_llm", {}).get("edit_output_dir")
+                               or "/Users/brown/Documents/Rosa")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"job-{job['id']}.txt"
+                out_path.write_text(result or "", encoding="utf-8")
+                job["status"] = "done"
+                job["result_path"] = str(out_path)
+            except Exception as e:
+                job["status"] = "error"
+                job["error"] = str(e)[:200]
+                log(f"[rosa-queue] job {job['id']} failed: {e!r}")
+            signals.rosa_write_queue(jobs)
+        except Exception as e:
+            log(f"[rosa-queue] loop error: {e!r}")
+            time.sleep(2.0)
+
+
 async def speak_reply_local(mouth: Mouth, text: str) -> bool:
     """Answers entirely with the local model — no Claude turn at all,
     so zero tokens spent. Returns True once spoken; False if local
@@ -980,6 +1059,41 @@ async def amain():
     log(f"[backtalk] up — agent={NAME} dir={CFG['agent_dir']} "
         f"model={brain.model} mic={mode} "
         f"(say 'goodbye {NAME.lower()}' to hang up)")
+
+    # A face's page-load mic-priming (core.js's micPrime(), see
+    # ai-visualizer) holds an open mic stream for the round-trip of a
+    # getUserMedia() call -- macOS ducks other apps' output volume for
+    # as long as anything holds one open. If that overlaps the greeting
+    # (the loudest single thing this session says, and the first),
+    # confirmed live 2026-09-08 as anywhere from a quiet start to the
+    # whole greeting getting ducked, depending on exactly how the
+    # timing landed. A first attempt gated this in the launching SHELL
+    # SCRIPT instead (streamdeck_talk_to_cipher.sh polling for the
+    # signal before ever launching backtalk) -- confirmed live that
+    # still isn't reliable: it can only wait so long before giving up
+    # and launching backtalk anyway, and a face slow to finish loading
+    # under real system load can still fire its mic grab AFTER that
+    # timeout gave up, landing squarely on the greeting regardless.
+    # More correct here: gate the one thing that actually needs
+    # protecting (the greeting itself), not the whole launch.
+    #
+    # Only worth checking at all if a visualizer server is actually up
+    # -- a cheap local socket probe, not the slower poll below, so a
+    # plain restart with no face involved pays close to zero cost
+    # instead of a blind bounded wait regardless of relevance.
+    def _visualizer_reachable() -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", 8790), timeout=0.3):
+                return True
+        except OSError:
+            return False
+
+    if await asyncio.get_running_loop().run_in_executor(None, _visualizer_reachable):
+        if not signals.mic_recently_primed(3.0):
+            for _ in range(16):  # 16 * 0.25s = 4s bounded wait
+                if signals.mic_recently_primed(3.0):
+                    break
+                await asyncio.sleep(0.25)
     mouth.say(CFG["greeting"])
 
     loop = asyncio.get_event_loop()
@@ -1008,7 +1122,19 @@ async def amain():
         # simultaneous still hides both behind the spoken line (it's a
         # few seconds long), just not fighting Kokoro for the GPU at
         # its single most contention-sensitive moment.
-        await asyncio.sleep(1.5)
+        #
+        # A fixed 1.5s stagger isn't actually reliable, though --
+        # confirmed live 2026-09-08: under real system load, "up" to
+        # local_llm actually loading measured 6s, not 1.5, and the
+        # greeting was still audibly mid-speech (two underflow hits
+        # logged right in that window). A blind timer can't adapt to
+        # how long the greeting or this task's own scheduling actually
+        # takes under current load. Wait for the real condition instead
+        # -- mouth.wait_done() returns the moment the greeting's queue
+        # is actually empty and playback has stopped, whatever that
+        # takes -- bounded by a generous timeout so a genuinely wedged
+        # mouth can't stall these warmups forever.
+        await loop.run_in_executor(None, mouth.wait_done, 15.0)
         loop.run_in_executor(None, warm_ears)
         if CFG.get("local_llm", {}).get("enabled"):
             from backtalk import local_llm
@@ -1083,6 +1209,7 @@ async def amain():
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     threading.Thread(target=_browser_typed_reader, args=(typed_q,), daemon=True).start()
+    threading.Thread(target=_rosa_queue_loop, daemon=True).start()
     typed_fut: asyncio.Future | None = None
 
     async def run_console(verb):
@@ -1284,6 +1411,13 @@ async def amain():
                 speak_task.cancel()
             mouth.shut_up()
             mouth.say(CFG["signoff"])
+            # mouth.say() is a no-op in silent mode (no TTS at all), and
+            # unlike every normal reply this text was never separately
+            # written to the transcript -- so a typed goodbye in the chat
+            # window used to vanish with zero confirmation. Every other
+            # reply shows up in transcript regardless of mode; the
+            # signoff should too. (Kevin's ask, 2026-09-07.)
+            signals.transcript(NAME, CFG["signoff"])
             mouth.wait_done(timeout=15)
             return False
         if speak_task and not speak_task.done():
@@ -1381,6 +1515,9 @@ async def amain():
                     speak_task.cancel()
                 mouth.shut_up()
                 mouth.say(CFG["signoff"])
+                # Same transcript gap as the typed/spoken quit path above --
+                # silent mode drops mouth.say() with no fallback otherwise.
+                signals.transcript(NAME, CFG["signoff"])
                 mouth.wait_done(timeout=15)
                 return
             if typed_fut in done:

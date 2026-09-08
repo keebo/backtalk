@@ -28,6 +28,9 @@ is the whole integration surface:
   .voice_source       cloud | local — which model answered the turn
                       currently in flight; only written when
                       local_llm.enabled is on
+  .rosa_queue.json    JSON list of Rosa job-queue entries (ai-visualizer's
+                      /rosa_submit appends, _rosa_queue_loop below drains
+                      and updates status in place)
 
 "working" is distinct from "thinking": thinking is the model composing
 a reply with nothing to show yet; working is a tool call actually
@@ -69,7 +72,9 @@ _THINKING_VOLUME_FILE = os.path.join(_DIR, ".thinking_volume")
 _VOICE_VOLUME_FILE = os.path.join(_DIR, ".voice_volume")
 _SILENT_MODE_FILE = os.path.join(_DIR, ".silent_mode")
 _TYPED_INPUT_FILE = os.path.join(_DIR, ".typed_input")
+_MIC_PRIMED_FILE = os.path.join(_DIR, ".mic_primed")
 _MODEL_FILE = os.path.join(_DIR, ".voice_model")
+_ROSA_QUEUE_FILE = os.path.join(_DIR, ".rosa_queue.json")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -336,6 +341,27 @@ def is_silent_mode() -> bool:
         return False
 
 
+def mic_recently_primed(max_age_s: float) -> bool:
+    """True if ai-visualizer's core.js wrote .mic_primed within the last
+    max_age_s seconds -- i.e. a face's page-load mic-priming genuinely
+    just happened (or is about to release), not a stale leftover from
+    hours ago. Backtalk's own startup uses this to know whether it's
+    even worth waiting before the greeting -- see amain()'s use of this
+    right before mouth.say(CFG["greeting"]).
+
+    Deliberately reads, never clears -- unlike get_typed_input(), this
+    is a timestamp other processes may also want to check, not a
+    one-shot message. Never raises; missing/malformed just means no
+    evidence of recent priming, which is also the correct answer for a
+    plain restart where no face ever opened at all."""
+    try:
+        with open(_MIC_PRIMED_FILE) as f:
+            written_at = float(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    return (time.time() - written_at) <= max_age_s
+
+
 def get_typed_input() -> str | None:
     """One pending typed message from a face's chat box (ai-visualizer's
     /type endpoint), or None. Read-and-clear: the file is emptied the
@@ -355,6 +381,28 @@ def get_typed_input() -> str | None:
     except OSError:
         pass
     return text
+
+
+def rosa_read_queue() -> list:
+    """The Rosa job queue (ai-visualizer's /rosa_submit writes here,
+    _rosa_queue_loop in main.py drains it). Never raises -- an unreadable
+    or missing file just means no jobs yet."""
+    try:
+        with open(_ROSA_QUEUE_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def rosa_write_queue(jobs: list):
+    """Never raises -- a failed write just means the UI's status lags
+    one tick behind, not a crashed voice line."""
+    try:
+        with open(_ROSA_QUEUE_FILE, "w") as f:
+            json.dump(jobs, f)
+    except OSError:
+        pass
 
 
 def _player_cmd(path: str) -> list[str] | None:

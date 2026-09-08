@@ -83,6 +83,28 @@ _UNDERFLOW_RECOVERY_THRESHOLD = 10
 _UNDERFLOW_BURST_WINDOW_S = 90
 _UNDERFLOW_BURST_THRESHOLD = 8
 
+# A sentence that's sat unplayed this long is almost certainly stale --
+# from a reply about a task that's since moved on, not something worth
+# making Kevin sit through out of order. Confirmed live 2026-09-08: a
+# session with many rapid background-task-triggered replies backed the
+# queue up across nearly two hours, so newer sentences kept queuing
+# behind an ever-growing pile of old ones instead of ever catching up.
+# Dropping stale entries means the mouth always converges back to
+# "roughly current" instead of dutifully narrating the whole backlog.
+#
+# Raised 20 -> 45, same day, after a real interaction with the OTHER
+# fix built later that same session: _stream_kokoro_mlx's stall timeout
+# (_SYNTH_STALL_TIMEOUT_S, see below) can itself burn up to 8s per
+# sentence when synthesis stalls. A short run of stalls (very plausible
+# under the same heavy-load conditions that trigger a stall in the
+# first place) could burn 16-24s before ever reaching a LATER sentence
+# that was never itself slow -- just queued behind slower ones -- and
+# the original 20s threshold was tight enough to wrongly drop it too.
+# 45s gives comfortable headroom for several stalls plus normal
+# playback, while staying nowhere near the ~2-hour backlog scenario
+# this was originally built to fix.
+_STALE_SENTENCE_MAX_AGE_S = 45
+
 _pipe = None
 _pipe_lock = threading.Lock()
 
@@ -302,10 +324,53 @@ def warm_mlx():
     return _mlx_model
 
 
+_SYNTH_STALL_TIMEOUT_S = 8.0
+
+
 def _stream_kokoro_mlx(text: str, voice: str | None = None):
     """One sentence -> int16 PCM chunks at 24kHz, via mlx-audio. Same
     output contract as _stream_kokoro (same sample rate, same dtype),
-    so synth_stream()'s caller needs no changes either way."""
+    so synth_stream()'s caller needs no changes either way.
+
+    Confirmed live 2026-09-08: under heavy system load, model.generate()
+    can simply stall with no exception, no partial output, nothing --
+    unlike the ElevenLabs path a few functions up, which has always had
+    an explicit timeout. A stall here left the whole mouth pipeline
+    silent for 10s+ at a time with zero signal in the log, since
+    execution never even reached the underflow-reporting write() call
+    downstream. Fix: run generation on a background thread and only
+    ever wait _SYNTH_STALL_TIMEOUT_S per chunk from the consumer side --
+    a stall now surfaces as a logged, bounded skip instead of an
+    unbounded hang.
+
+    That background thread MUST register its own MLX GPU stream before
+    touching the model: MLX's default stream is thread-local, and a
+    thread that has never called into MLX has no stream registered --
+    the first op through it aborts the WHOLE PROCESS with an uncaught
+    C++ exception ("There is no Stream(gpu, N) in current thread") that
+    no Python try/except can catch. Confirmed live 2026-09-08: this
+    crashed backtalk on every single restart, since a fresh thread here
+    is by definition one MLX has never seen. mx.new_thread_unsafe_stream
+    is MLX's own documented API for exactly this -- a stream safe to use
+    from any thread, verified directly against mlx.core 0.32.1's
+    docstring and by reproducing the crash standalone, then confirming
+    three sequential fresh-thread sentences all synthesize clean once
+    this call is added. A brand-new thread and stream per sentence is
+    kept deliberately (over one persistent worker thread) so a
+    genuinely hung generate() call only stalls the one sentence it
+    belongs to, not every sentence queued after it.
+
+    Known, accepted residual risk, not fully closed: if this abandons a
+    stalled call, that background thread is still technically alive
+    inside model.generate() on the shared _mlx_model object. If the
+    VERY NEXT sentence starts generating before that orphaned thread
+    ever returns, two calls run concurrently against the same model.
+    Unconfirmed whether mlx-audio's generate() is safe under that
+    exact condition -- not treated as blocking here because it's a
+    low-probability compounding case, and even a possible glitch from
+    it is strictly better than the guaranteed, total silence this
+    fixes. Revisit if a new, different-shaped audio artifact shows up
+    specifically following a logged stall."""
     model = warm_mlx()
     v = voice or CFG["voice"]
     lang = (v or "bm_lewis")[0]
@@ -313,8 +378,34 @@ def _stream_kokoro_mlx(text: str, voice: str | None = None):
         speed = float(CFG.get("speed") or 1.0)
     except (TypeError, ValueError):
         speed = 1.0
-    for result in model.generate(text, voice=v, lang_code=lang, speed=speed):
-        a = np.asarray(result.audio, dtype=np.float32)
+
+    chunk_q: queue.Queue = queue.Queue()
+    _DONE = object()
+
+    def _produce():
+        import mlx.core as mx
+        mx.set_default_stream(mx.new_thread_unsafe_stream(mx.gpu))
+        try:
+            for result in model.generate(text, voice=v, lang_code=lang, speed=speed):
+                chunk_q.put(result)
+        except Exception as e:
+            chunk_q.put(e)
+        finally:
+            chunk_q.put(_DONE)
+
+    threading.Thread(target=_produce, daemon=True).start()
+    while True:
+        try:
+            item = chunk_q.get(timeout=_SYNTH_STALL_TIMEOUT_S)
+        except queue.Empty:
+            log(f"[mouth] MLX synthesis stalled >{_SYNTH_STALL_TIMEOUT_S:.0f}s -- "
+                f"abandoning this sentence rather than hang: {text[:60]!r}")
+            return
+        if item is _DONE:
+            return
+        if isinstance(item, Exception):
+            raise item
+        a = np.asarray(item.audio, dtype=np.float32)
         if a.size:
             yield (np.clip(a, -1.0, 1.0) * 32767).astype(np.int16)
 
@@ -611,7 +702,7 @@ class Mouth:
         if signals.is_silent_mode():
             return
         for s in split_sentences(text):
-            self._q.put((s, None, voice))
+            self._q.put((s, None, voice, time.time()))
 
     def say_chunk(self, text: str, directions=None, voice: str | None = None):
         """Queue text as ONE TTS request, no sentence splitting — fuller
@@ -631,7 +722,7 @@ class Mouth:
             return
         text = text.strip()
         if text:
-            self._q.put((text, directions or None, voice))
+            self._q.put((text, directions or None, voice, time.time()))
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
@@ -660,8 +751,12 @@ class Mouth:
         from backtalk import signals
         while True:
             item = self._q.get()
-            sentence, directions, voice = item
+            sentence, directions, voice, enqueued_at = item
             if not sentence:
+                continue
+            age = time.time() - enqueued_at
+            if age > _STALE_SENTENCE_MAX_AGE_S:
+                log_debug(f"[mouth] dropping stale sentence ({age:.1f}s old): {sentence[:60]!r}")
                 continue
             self._stop.clear()
             self._speaking.set()

@@ -326,17 +326,31 @@ def warm():
 def transcribe(pcm: np.ndarray) -> str:
     """int16 mono 16kHz -> text. Bracketed non-speech markers that
     whisper emits ([BLANK_AUDIO], [SIGHS], (coughs)...) are stripped;
-    if nothing remains, it was silence."""
+    if nothing remains, it was silence.
+
+    Deliberately does NOT pin temperature=0.0 (as it used to, until
+    2026-09-07): both mlx_whisper and faster-whisper default temperature
+    to a FALLBACK LADDER, (0.0, 0.2, 0.4, ...), paired with a
+    compression_ratio/logprob check -- greedy (temp 0) decoding is tried
+    first, and only escalated to a higher, less-deterministic temperature
+    if that result looks degenerate. A repeated n-gram loop ("a little
+    bit of a little bit of...", the exact failure caught live this day,
+    ~30 repeats off one press) is maximally compressible, precisely what
+    that check exists to catch -- but pinning temperature to a bare 0.0
+    disables the whole ladder, so a loop that starts has no escape and
+    rides out the rest of the recording. Confirmed via each library's own
+    function signature: both ship the ladder as their literal default,
+    so omitting the argument here just stops overriding it."""
     model = warm()
     audio = pcm.astype(np.float32) / 32768.0
     lang = "en" if CFG["stt_model"].endswith(".en") else None
     if _backend == "mlx":
         import mlx_whisper
         text = mlx_whisper.transcribe(audio, path_or_hf_repo=model,
-                                      temperature=0.0, language=lang,
+                                      language=lang,
                                       verbose=None)["text"].strip()
     else:
-        segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
+        segments, _ = model.transcribe(audio, language=lang)
         text = "".join(s.text for s in segments).strip()
     return _NONSPEECH.sub("", text).strip()
 

@@ -257,6 +257,25 @@ class WarmBrain:
                 if isinstance(resets, str):
                     resets = int(datetime.fromisoformat(resets).timestamp())
                 signals.set_rate_limit(window, pct, resets)
+            # Per-model weekly quotas -- a separate field from the two
+            # account-wide windows above, confirmed live 2026-09-07 by
+            # dumping a raw get_usage response: `rate_limits.model_scoped`
+            # is a list of {display_name, utilization, resets_at}, one
+            # entry per model that has its own scoped limit (currently
+            # just Fable). Same percentage/ISO shape as five_hour/
+            # seven_day, so the same conversion applies. Keyed by the
+            # model's own lowercased name rather than hardcoded to
+            # "fable" so a future second scoped model shows up for free.
+            for m in (usage.get("rate_limits") or {}).get("model_scoped") or []:
+                name = (m.get("display_name") or "").strip().lower()
+                if not name:
+                    continue
+                pct = m.get("utilization")
+                pct = pct / 100 if pct is not None else None
+                resets = m.get("resets_at")
+                if isinstance(resets, str):
+                    resets = int(datetime.fromisoformat(resets).timestamp())
+                signals.set_rate_limit(name, pct, resets)
         except Exception:
             pass
 
