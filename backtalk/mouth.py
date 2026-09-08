@@ -757,6 +757,7 @@ class Mouth:
             age = time.time() - enqueued_at
             if age > _STALE_SENTENCE_MAX_AGE_S:
                 log_debug(f"[mouth] dropping stale sentence ({age:.1f}s old): {sentence[:60]!r}")
+                self._settle_if_queue_empty(signals)
                 continue
             self._stop.clear()
             self._speaking.set()
@@ -768,26 +769,39 @@ class Mouth:
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
-                if self._q.empty():
-                    self._speaking.clear()
-                    self.ducker.speech_end()
-                    # Only declare idle if the brain agrees the turn is
-                    # actually over. Mid-turn (a tool call about to run,
-                    # or more text still coming) this queue drains too —
-                    # restore whatever brain.ask_stream currently wants
-                    # shown instead of leaving the bus on "speaking",
-                    # which this same loop just wrote and which is stale
-                    # the moment audio actually stops.
-                    if self._turn_active is None or not self._turn_active():
-                        # The reply has genuinely stopped talking —
-                        # distinct from the state going idle between
-                        # sentences of the same reply, which anything
-                        # waiting for a fully-drained turn (the
-                        # transcript/activity panels) wants to know.
-                        signals.reply_done()
-                        signals.set_state("idle")
-                    elif self._turn_state is not None:
-                        signals.set_state(self._turn_state())
+                self._settle_if_queue_empty(signals)
+
+    def _settle_if_queue_empty(self, signals):
+        """Shared by both a played sentence's own finally block and a
+        dropped stale sentence -- confirmed live 2026-09-08: the stale
+        path's early `continue` used to skip this entirely, so if the
+        LAST item(s) left in the queue all got dropped as stale (not
+        played), nothing ever cleared self._speaking or declared idle.
+        The state bus just stayed on "speaking" indefinitely -- audio
+        long since silent, visualizer stuck -- until the next real turn
+        forced a change. Now runs after every item, played or dropped,
+        since it's the queue actually draining that matters, not which
+        path got each item there."""
+        if self._q.empty():
+            self._speaking.clear()
+            self.ducker.speech_end()
+            # Only declare idle if the brain agrees the turn is
+            # actually over. Mid-turn (a tool call about to run,
+            # or more text still coming) this queue drains too —
+            # restore whatever brain.ask_stream currently wants
+            # shown instead of leaving the bus on "speaking",
+            # which this same loop just wrote and which is stale
+            # the moment audio actually stops.
+            if self._turn_active is None or not self._turn_active():
+                # The reply has genuinely stopped talking —
+                # distinct from the state going idle between
+                # sentences of the same reply, which anything
+                # waiting for a fully-drained turn (the
+                # transcript/activity panels) wants to know.
+                signals.reply_done()
+                signals.set_state("idle")
+            elif self._turn_state is not None:
+                signals.set_state(self._turn_state())
 
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened when the sample
