@@ -73,6 +73,7 @@ _VOICE_VOLUME_FILE = os.path.join(_DIR, ".voice_volume")
 _SILENT_MODE_FILE = os.path.join(_DIR, ".silent_mode")
 _TYPED_INPUT_FILE = os.path.join(_DIR, ".typed_input")
 _MIC_PRIMED_FILE = os.path.join(_DIR, ".mic_primed")
+_MIC_PRIMING_STARTED_FILE = os.path.join(_DIR, ".mic_priming_started")
 _MODEL_FILE = os.path.join(_DIR, ".voice_model")
 _ROSA_QUEUE_FILE = os.path.join(_DIR, ".rosa_queue.json")
 
@@ -356,6 +357,30 @@ def mic_recently_primed(max_age_s: float) -> bool:
     plain restart where no face ever opened at all."""
     try:
         with open(_MIC_PRIMED_FILE) as f:
+            written_at = float(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    return (time.time() - written_at) <= max_age_s
+
+
+def mic_priming_recently_started(max_age_s: float) -> bool:
+    """True if ai-visualizer's core.js wrote .mic_priming_started (the
+    FIRST half of the two-phase mic-prime signal, fired before the
+    actual getUserMedia() round-trip -- see .mic_primed above for the
+    second half) within the last max_age_s seconds.
+
+    Added 2026-09-08 alongside a real fix: a single bounded wait for
+    only the "done" signal forced backtalk to guess how long to wait
+    before giving up, and that guess failed live under real system
+    load (a real priming round-trip measured 10s against a 4s bound).
+    This lets a caller distinguish two genuinely different situations
+    with real evidence instead of one blind timer: "started" never
+    showing up means priming isn't happening THIS session at all (no
+    reason to keep waiting); "started" showing up means it's genuinely
+    in progress, so waiting longer for "done" is justified, however
+    long that actually takes. Never raises, same as mic_recently_primed."""
+    try:
+        with open(_MIC_PRIMING_STARTED_FILE) as f:
             written_at = float(f.read().strip())
     except (OSError, ValueError):
         return False

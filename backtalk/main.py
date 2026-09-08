@@ -702,7 +702,7 @@ def _rosa_queue_loop():
                         f"input is {len(content)} chars, over the "
                         f"{ROSA_QUEUE_MAX_CHARS}-char cap for a single job")
                 prompt = f"{job['instruction']}\n\n{content}"
-                result = local_llm.delegate(prompt)
+                result = local_llm.delegate_job(prompt)
                 out_dir = Path(CFG.get("local_llm", {}).get("edit_output_dir")
                                or "/Users/brown/Documents/Rosa")
                 out_dir.mkdir(parents=True, exist_ok=True)
@@ -1067,20 +1067,27 @@ async def amain():
     # (the loudest single thing this session says, and the first),
     # confirmed live 2026-09-08 as anywhere from a quiet start to the
     # whole greeting getting ducked, depending on exactly how the
-    # timing landed. A first attempt gated this in the launching SHELL
-    # SCRIPT instead (streamdeck_talk_to_cipher.sh polling for the
-    # signal before ever launching backtalk) -- confirmed live that
-    # still isn't reliable: it can only wait so long before giving up
-    # and launching backtalk anyway, and a face slow to finish loading
-    # under real system load can still fire its mic grab AFTER that
-    # timeout gave up, landing squarely on the greeting regardless.
-    # More correct here: gate the one thing that actually needs
-    # protecting (the greeting itself), not the whole launch.
+    # timing landed. Two earlier attempts here both relied on ONE
+    # bounded wait for the "done" signal alone -- first gated in the
+    # launching shell script, then moved here (this IS the right layer:
+    # launcher-agnostic, protects the greeting regardless of how
+    # backtalk was started) -- but a single blind bound still isn't
+    # reliable: confirmed live a real priming round-trip can take 10s+
+    # under heavy system load, well past any timeout small enough to
+    # not needlessly delay every greeting.
+    #
+    # Two-phase fix instead of a bigger guess: core.js now signals
+    # BOTH when priming STARTS (before the getUserMedia() round-trip)
+    # and when it's DONE. That turns this into an evidence-based
+    # decision rather than one timer -- "started" never showing up
+    # within a short window means priming isn't happening this session
+    # at all (nothing to wait for); "started" showing up is real proof
+    # it's in progress, which justifies waiting much longer for "done",
+    # however long that actually takes.
     #
     # Only worth checking at all if a visualizer server is actually up
-    # -- a cheap local socket probe, not the slower poll below, so a
-    # plain restart with no face involved pays close to zero cost
-    # instead of a blind bounded wait regardless of relevance.
+    # -- a cheap local socket probe, not either poll below, so a plain
+    # restart with no face involved pays close to zero cost.
     def _visualizer_reachable() -> bool:
         try:
             with socket.create_connection(("127.0.0.1", 8790), timeout=0.3):
@@ -1090,10 +1097,17 @@ async def amain():
 
     if await asyncio.get_running_loop().run_in_executor(None, _visualizer_reachable):
         if not signals.mic_recently_primed(3.0):
-            for _ in range(16):  # 16 * 0.25s = 4s bounded wait
-                if signals.mic_recently_primed(3.0):
+            started = False
+            for _ in range(20):  # 20 * 0.25s = 5s bound: is priming even happening?
+                if signals.mic_priming_recently_started(6.0):
+                    started = True
                     break
                 await asyncio.sleep(0.25)
+            if started:
+                for _ in range(80):  # 80 * 0.25s = 20s bound: real evidence it's coming
+                    if signals.mic_recently_primed(3.0):
+                        break
+                    await asyncio.sleep(0.25)
     mouth.say(CFG["greeting"])
 
     loop = asyncio.get_event_loop()

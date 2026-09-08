@@ -239,3 +239,45 @@ def delegate(text: str) -> str:
     return _generate_raw(model, tokenizer, text,
                           system=_delegate_system_prompt(),
                           max_tokens=max_tokens)
+
+
+def _job_system_prompt() -> str:
+    """For a job Kevin submits directly through a face's own widget
+    (the Rosa job queue, main.py's _rosa_queue_loop) — a genuinely
+    different calling context from delegate() above, not just a
+    relabeling of it. delegate()'s "no commentary, no meta-discussion"
+    instruction exists because CIPHER calls it and needs a bare,
+    parseable result to use programmatically; it was never written
+    with a Kevin-facing use case in mind. Confirmed live 2026-09-08:
+    that blanket instruction was silently overriding a "report the
+    specific changes you made" instruction Kevin gave through the
+    widget, since a stronger, foundational system-prompt constraint
+    beats a conflicting task instruction on a model this size. This
+    prompt drops that restriction instead of loosening delegate()
+    itself, which would risk Cipher's own internal calls getting
+    unwanted chattier results back."""
+    cfg = CFG.get("local_llm", {})
+    name = cfg.get("name") or "the local assistant"
+    return (
+        f"You are {name}, completing a task Kevin submitted directly "
+        "through his own tool, not a sub-task from Cipher. Follow the "
+        "instruction exactly, including any requested formatting or "
+        "additional detail it asks for — a summary of changes made, "
+        "an explanation, or anything else explicitly requested. Don't "
+        "add anything beyond what was actually asked for."
+    )
+
+
+def delegate_job(text: str) -> str:
+    """Same mechanics as delegate() (blocking, same generation path),
+    but for a job Kevin submitted directly through a face's widget —
+    see _job_system_prompt() for why this needs its own, less
+    restrictive prompt instead of reusing delegate()'s. Slightly more
+    token headroom than delegate()'s default, since "corrected text
+    plus a changes summary" genuinely needs more room than a bare
+    result for anything beyond a short passage."""
+    model, tokenizer = warm()
+    max_tokens = CFG.get("local_llm", {}).get("job_max_tokens", 2400)
+    return _generate_raw(model, tokenizer, text,
+                          system=_job_system_prompt(),
+                          max_tokens=max_tokens)
