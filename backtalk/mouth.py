@@ -104,6 +104,20 @@ _UNDERFLOW_BURST_THRESHOLD = 8
 # playback, while staying nowhere near the ~2-hour backlog scenario
 # this was originally built to fix.
 _STALE_SENTENCE_MAX_AGE_S = 45
+# A dropped sentence is silent by default -- Kevin gets no signal on either
+# channel (spoken or on-screen transcript) that anything was skipped, which
+# is exactly the gap that caused real confusion 2026-09-09: a reply queued
+# during a heavy tool-use stretch got dropped as stale, and separately the
+# transcript display (a backgrounded pop-out window, throttled by the
+# browser under that same load) missed the update too. Rather than chase
+# either channel's timing directly, this makes drops self-announcing: a
+# short catch-up notice gets queued fresh (so the transcript write for THAT
+# notice happens at a new, current timestamp, giving a throttled display a
+# fresh signal to latch onto even if the original one never rendered).
+# Cooldown avoids re-announcing for every sentence in the same burst of
+# drops (the original incident dropped two in a row) -- one notice per
+# burst, not one per sentence.
+_DROP_NOTICE_COOLDOWN_S = 15
 
 _pipe = None
 _pipe_lock = threading.Lock()
@@ -683,6 +697,30 @@ class Mouth:
         # this the "speaking" write below just sits stale through however
         # much of the tool call is left — see the finally block.
         self._turn_state = None
+        self._last_drop_notice_at = 0.0
+
+    def _notify_dropped(self, signals):
+        """Best-effort catch-up notice after a stale-sentence drop -- see
+        _DROP_NOTICE_COOLDOWN_S. Deliberately generic rather than trying to
+        repeat the lost content: the original text is still sitting in the
+        transcript file (emit() writes it before queueing for speech), so
+        nothing is actually gone, it just wasn't seen/heard live. This
+        notice's only job is to be a fresh, current signal on both channels
+        that something was skipped, so a glance back at the transcript
+        finds it."""
+        now = time.time()
+        if now - self._last_drop_notice_at < _DROP_NOTICE_COOLDOWN_S:
+            return
+        self._last_drop_notice_at = now
+        notice = ("Sorry, I got backed up there and some of what I said "
+                   "may not have come through — worth a glance back at "
+                   "the transcript if you want the exact wording.")
+        try:
+            name = CFG.get("name", "C.I.P.H.E.R.")
+            signals.transcript(name, notice)
+        except Exception:
+            pass
+        self._q.put((notice, None, None, time.time()))
 
     @property
     def speaking(self) -> bool:
@@ -757,6 +795,7 @@ class Mouth:
             age = time.time() - enqueued_at
             if age > _STALE_SENTENCE_MAX_AGE_S:
                 log_debug(f"[mouth] dropping stale sentence ({age:.1f}s old): {sentence[:60]!r}")
+                self._notify_dropped(signals)
                 self._settle_if_queue_empty(signals)
                 continue
             self._stop.clear()
