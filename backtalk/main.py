@@ -836,7 +836,8 @@ async def speak_reply_proofread(mouth: Mouth, text: str) -> bool:
     return True
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str,
+                       interrupted_reply: bool = False):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
     short sentences come out flat).
@@ -845,7 +846,19 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     local_llm.enabled — see router.py for the local-vs-cloud call and
     speak_reply_local for that path. "Ask Cipher directly" (or a few
     close variants) forces cloud regardless of what the router would
-    have picked."""
+    have picked.
+
+    interrupted_reply carries the mouth.shut_up() finding from handle()
+    -- deliberately NOT baked into `text` before this point. Every
+    router check below (is_affirmative, is_resend_last,
+    strip_force_local, the pending_forward substitution) matches
+    against the RAW utterance; prepending a warning sentence first
+    broke that matching outright (found live 2026-09-10: a plain "yes"
+    confirming Rosa's "forward this to Cipher?" stopped being recognized
+    as affirmative once the warning text came before it, silently
+    losing Kevin's original question). The warning is applied once,
+    below, only to whatever text actually ends up cloud-bound -- after
+    every routing decision has already run on the clean original."""
     local_on = CFG.get("local_llm", {}).get("enabled")
     if local_on and router.is_resend_last(text) and \
             _ROUTER_STATE.get("last_local_question"):
@@ -923,6 +936,22 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
                     # the normal cloud path below instead of going
                     # silent.
                 signals.set_source("cloud")
+
+    if interrupted_reply:
+        # mouth.shut_up() discarded real audio -- mid-playback or still
+        # queued unplayed -- so the model's own prior reply, still
+        # sitting in its own conversation history, may never have
+        # actually reached Kevin. Applied here, not earlier: every
+        # routing decision above has already run on the clean text, so
+        # this can't break is_affirmative/pending_forward matching the
+        # way prepending it before routing did (see the docstring).
+        text = (
+            "[Your previous reply's audio was interrupted by this "
+            "new message before Kevin finished hearing it -- some "
+            "or all of it may never have reached him. Don't assume "
+            "he heard it; if he's asking about it, answer as if "
+            "he's hearing it for the first time.] " + text
+        )
 
     t0 = time.time()
     first = True
@@ -1490,24 +1519,8 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
-        brain_text = text
-        if interrupted_reply:
-            # mouth.shut_up() above just discarded real audio -- mid-
-            # playback or still queued unplayed -- so the model's own
-            # prior reply, still sitting in its own conversation
-            # history, may never have actually reached Kevin. Without
-            # this note the model has no way to know that and will
-            # confidently claim "I already told you" from text history
-            # alone. Kevin's ask, 2026-09-10, after exactly that
-            # happened during a background-task-heavy stretch.
-            brain_text = (
-                "[Your previous reply's audio was interrupted by this "
-                "new message before Kevin finished hearing it -- some "
-                "or all of it may never have reached him. Don't assume "
-                "he heard it; if he's asking about it, answer as if "
-                "he's hearing it for the first time.] " + text
-            )
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, brain_text))
+        speak_task = asyncio.create_task(
+            speak_reply(brain, mouth, text, interrupted_reply=interrupted_reply))
         return True
 
     try:
