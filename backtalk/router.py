@@ -36,6 +36,7 @@ speak_reply_local and signals.set_source) always tells Kevin which one
 answered, and the force-cloud phrase below is the escape hatch for
 "no, I want the real answer" without more than half a second of talking.
 """
+import re
 
 # Whisper mishears "Cipher" the same handful of ways across every
 # phrase that names her, spoken or typed as a transcript — this is the
@@ -207,18 +208,22 @@ def is_awaiting_answer(sentence: str) -> bool:
 # here — a bare "yes" reaching Cipher with no context is useless, so
 # main.py needs to know specifically that a YES means "resend the
 # original question," not "send this."
-_FORWARD_OFFER_CUES = (
-    "forward this to cipher", "forward it to cipher",
-    "forward that to cipher", "send this to cipher",
-    "send it to cipher", "send that to cipher",
-    "pass this to cipher", "pass it to cipher",
-)
+# Was a fixed literal-phrase list ("forward this to cipher", etc.) --
+# broke live 2026-09-10 the first time Rosa phrased it any differently
+# ("Want me to forward this REQUEST to Cipher?" -- one extra word was
+# enough to miss every entry). Rosa's an LLM; she won't reliably repeat
+# the exact same wording. Loosened to a pattern instead: the verb and
+# "cipher" just need to both appear, verb first -- still narrow enough
+# not to false-positive on the reverse case ("Cipher forwarded me a
+# document...", tested), but no longer brittle against normal phrasing
+# drift the way an exact-string whitelist is.
+_FORWARD_OFFER_PATTERN = re.compile(r"\b(forward|send|pass)\b.*\bcipher\b")
 
 
 def is_forward_offer(sentence: str) -> bool:
     """True if Rosa's reply is offering to escalate the question that
     was just asked, rather than a generic pending question of her own."""
-    return any(cue in sentence.lower() for cue in _FORWARD_OFFER_CUES)
+    return bool(_FORWARD_OFFER_PATTERN.search(sentence.lower()))
 
 
 # A short, deliberately narrow whitelist — matched as whole words/phrases
