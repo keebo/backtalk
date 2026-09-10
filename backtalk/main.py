@@ -1043,6 +1043,17 @@ async def amain():
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth),
                       resume_id=resume_id)
+    # Armed here, before warmup/greeting, not after -- PTTListener's
+    # __init__ attaches the real OS-level key hook immediately
+    # (self._listener.start()). Built this late used to leave a real
+    # window where the greeting had already finished speaking (so it
+    # sounded ready) but the key hook plain didn't exist yet -- a press
+    # during that window did nothing, silently, at the OS level, never
+    # even reaching Python to log. Confirmed live 2026-09-10: Kevin
+    # spoke right after the warmup ping finished and it was never
+    # captured at all. Root-caused, not guessed -- PTTListener's own
+    # docstring already says __init__ starts the listener immediately.
+    ptt = PTTListener(CFG["ptt_key"])
     mouth._turn_active = lambda: brain.turn_active
     mouth._turn_state = lambda: brain.current_state
     # A tool call can start (and with it, the thinking sound) while a
@@ -1501,13 +1512,13 @@ async def amain():
 
     try:
         # ONE loop, two mic modes, switchable live (_MIC). The talk key
-        # is constructed and honored in BOTH modes: in hands-free
-        # listening it is the interrupt and the guaranteed way to be
-        # heard over room noise. The open mic joins the wait-set only
+        # is honored in BOTH modes: in hands-free listening it is the
+        # interrupt and the guaranteed way to be heard over room noise.
+        # `ptt` itself is constructed much earlier now, before warmup --
+        # see the comment there. The open mic joins the wait-set only
         # in "open" mode; a mode switch bumps _MIC["gen"], the abort
         # callable closes the in-flight open mic promptly, and any
         # capture born under an old gen is discarded unprocessed.
-        ptt = PTTListener(CFG["ptt_key"])
         press_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
         hangup_fut = asyncio.ensure_future(hangup_event.wait())
