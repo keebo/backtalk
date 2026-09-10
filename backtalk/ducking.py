@@ -37,6 +37,35 @@ RESTORE_DEBOUNCE_S = 0.5
 
 _DARWIN = sys.platform == "darwin"
 
+# Cached per process lifetime, not permanently -- a fresh backtalk restart
+# re-checks, so installing Spotify later just works with no code change.
+# Root-caused 2026-09-10: with Spotify never installed, `_osa`'s "is
+# running" query below still had to ask macOS to resolve the app by name,
+# which is enough to trigger a fresh Automation permission prompt every
+# single speech_start() call -- forever, since no target ever existed to
+# record a lasting Allow/Deny against. `mdfind` is a pure Spotlight
+# metadata lookup, not an AppleEvent, so it never touches that permission
+# gate at all -- checking installation this way, once, avoids ever asking
+# macOS about Spotify in the first place when it's simply not there.
+_spotify_installed_cache: bool | None = None
+
+
+def _spotify_installed() -> bool:
+    global _spotify_installed_cache
+    if _spotify_installed_cache is None:
+        if not _DARWIN:
+            _spotify_installed_cache = False
+        else:
+            try:
+                r = subprocess.run(
+                    ["mdfind", "kMDItemCFBundleIdentifier == 'com.spotify.client'"],
+                    capture_output=True, text=True, timeout=2.0,
+                )
+                _spotify_installed_cache = bool(r.stdout.strip())
+            except Exception:
+                _spotify_installed_cache = False
+    return _spotify_installed_cache
+
 
 def _osa(script: str, timeout: float = 2.0) -> str | None:
     if not _DARWIN:
@@ -50,6 +79,8 @@ def _osa(script: str, timeout: float = 2.0) -> str | None:
 
 
 def _spotify_volume() -> int | None:
+    if not _spotify_installed():
+        return None
     if _osa('application "Spotify" is running') != "true":
         return None
     v = _osa('tell application "Spotify" to get sound volume')
