@@ -762,14 +762,22 @@ class Mouth:
         if text:
             self._q.put((text, directions or None, voice, time.time()))
 
-    def shut_up(self):
-        """Barge-in: stop current playback and flush everything queued."""
+    def shut_up(self) -> bool:
+        """Barge-in: stop current playback and flush everything queued.
+        Returns True if real content was interrupted -- either actively
+        playing or still queued unplayed -- so callers know the prior
+        reply may not have fully reached Kevin. See main.py's `handle()`,
+        which uses this to warn the model's own next turn rather than
+        let it assume an interrupted reply was heard in full."""
+        interrupted = self._speaking.is_set()
         self._stop.set()
         try:
             while True:
                 self._q.get_nowait()
+                interrupted = True
         except queue.Empty:
             pass
+        return interrupted
 
     def shutdown(self):
         """Exit path: stop playback and restore the music SYNCHRONOUSLY

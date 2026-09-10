@@ -1380,10 +1380,16 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None,
+                      already_interrupted: bool = False) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
-        told apart from speech that began before the ask even existed."""
+        told apart from speech that began before the ask even existed.
+        already_interrupted carries forward a mouth.shut_up() result
+        from BEFORE this call (the PTT press path flushes immediately
+        on press, well before this function ever runs) -- without it,
+        this function's own shut_up() call below would find an already-
+        drained queue and wrongly report nothing was interrupted."""
         nonlocal speak_task
         log(f"[you]    {text}")
         signals.transcript("you", text)
@@ -1459,7 +1465,7 @@ async def amain():
         # cause of the backlog — a finished task can still leave stale
         # audio behind for the new reply to pile up behind instead of
         # replacing. Always flush here regardless of task state.
-        mouth.shut_up()
+        interrupted_reply = mouth.shut_up() or already_interrupted
         verb = verb or console_match(text)
         if verb:
             await run_console(verb)
@@ -1473,7 +1479,24 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        brain_text = text
+        if interrupted_reply:
+            # mouth.shut_up() above just discarded real audio -- mid-
+            # playback or still queued unplayed -- so the model's own
+            # prior reply, still sitting in its own conversation
+            # history, may never have actually reached Kevin. Without
+            # this note the model has no way to know that and will
+            # confidently claim "I already told you" from text history
+            # alone. Kevin's ask, 2026-09-10, after exactly that
+            # happened during a background-task-heavy stretch.
+            brain_text = (
+                "[Your previous reply's audio was interrupted by this "
+                "new message before Kevin finished hearing it -- some "
+                "or all of it may never have reached him. Don't assume "
+                "he heard it; if he's asking about it, answer as if "
+                "he's hearing it for the first time.] " + text
+            )
+        speak_task = asyncio.create_task(speak_reply(brain, mouth, brain_text))
         return True
 
     try:
@@ -1579,7 +1602,7 @@ async def amain():
                     speak_task.cancel()          # the button = interrupt
                 # During a permission ask the TURN stays alive; the
                 # press only silences playback and records the answer.
-                mouth.shut_up()
+                pre_interrupted = mouth.shut_up()
                 signals.static_stop()            # button kills the static too
                 signals.set_state("listening")
                 mouth.ducker.speech_start()      # duck NOW, while you talk
@@ -1610,7 +1633,8 @@ async def amain():
                     log("[ptt] (tap or empty — ignored)")
                     signals.set_state("idle")
                     continue
-                if not await handle(text, spoke_from=press_t):
+                if not await handle(text, spoke_from=press_t,
+                                     already_interrupted=pre_interrupted):
                     return
     except KeyboardInterrupt:
         pass
