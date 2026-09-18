@@ -83,6 +83,19 @@ _UNDERFLOW_RECOVERY_THRESHOLD = 10
 _UNDERFLOW_BURST_WINDOW_S = 90
 _UNDERFLOW_BURST_THRESHOLD = 8
 
+# sd.OutputStream.write() is a blocking call that can hang forever with
+# NO exception and NO return -- the exact same failure shape already
+# known and unfixed on the mic side (sd.InputStream.read() can do the
+# same thing, see Active Priorities). Confirmed live 2026-09-17: a
+# session went completely mute mid-reply with zero log output of any
+# kind from this file -- not even an underflow notice -- until Kevin
+# restarted the whole machine, which only makes sense if the one worker
+# thread this whole file runs on was wedged inside a write() call that
+# never returned. A normal chunk here is ~92ms of audio (see the block
+# size below); this is a wide margin above that so a genuinely slow but
+# still-alive write is never mistaken for a hang.
+_WRITE_HANG_TIMEOUT_S = 2.0
+
 # A sentence that's sat unplayed this long is almost certainly stale --
 # from a reply about a task that's since moved on, not something worth
 # making Kevin sit through out of order. Confirmed live 2026-09-08: a
@@ -686,8 +699,15 @@ class Mouth:
         self._consecutive_underflows = 0
         self._underflow_burst: deque[float] = deque()
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
+        # Hung-write backstop (see _WRITE_HANG_TIMEOUT_S above). Set by the
+        # worker thread right before/after each blocking out.write() call;
+        # read (never mutated) by the watchdog thread on a different one.
+        self._write_in_flight_since: float | None = None
+        self._write_stream_ref: sd.OutputStream | None = None
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
+        self._watchdog = threading.Thread(target=self._watch_for_hung_write, daemon=True)
+        self._watchdog.start()
         # Late-bound (main.py sets this once the brain exists): tells the
         # worker whether a turn is still in flight, so draining the local
         # speech queue mid-turn doesn't get mistaken for the reply being over.
@@ -850,6 +870,37 @@ class Mouth:
             elif self._turn_state is not None:
                 signals.set_state(self._turn_state())
 
+    def _watch_for_hung_write(self):
+        """Backstop for a wedged out.write() call (see _WRITE_HANG_TIMEOUT_S).
+        Runs on its own thread for the life of the process. Deliberately
+        never touches self._out, self._out_rate, etc. -- those are
+        worker-thread-only (see _get_out/_drop_out). The only thing this
+        thread ever does is call abort() on the specific stream object it
+        saw the worker start writing to, which sounddevice/PortAudio makes
+        safe to call from another thread. That forces the blocked write()
+        to raise, which then flows through _play_stream's existing
+        except-clause (_drop_out + raise) exactly like any other device
+        error already does -- this adds a way for a silent hang to become
+        a real exception, not a second recovery path."""
+        while True:
+            time.sleep(0.5)
+            started = self._write_in_flight_since
+            stream = self._write_stream_ref
+            if started is None or stream is None:
+                continue
+            if time.monotonic() - started > _WRITE_HANG_TIMEOUT_S:
+                log(f"[mouth] output write hung for over {_WRITE_HANG_TIMEOUT_S}s "
+                    f"-- forcing the stream closed to unstick it")
+                try:
+                    stream.abort()
+                except Exception as e:
+                    log(f"[mouth] watchdog's own abort failed: {e}")
+                # Clear so this doesn't fire again on the same stale
+                # timestamp while the worker thread is still unwinding
+                # through the exception this just triggered.
+                self._write_in_flight_since = None
+                self._write_stream_ref = None
+
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened when the sample
         rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback: rare,
@@ -975,6 +1026,13 @@ class Mouth:
                 for i in range(0, len(pcm), block):
                     if self._stop.is_set():
                         return False
+                    self._write_in_flight_since = time.monotonic()
+                    self._write_stream_ref = out
+                    try:
+                        starved = out.write(pcm[i:i + block])
+                    finally:
+                        self._write_in_flight_since = None
+                        self._write_stream_ref = None
                     # write() returns True if PortAudio detected the
                     # output buffer starve before this call. Confirmed
                     # 2026-09-01 this fires far more often than it's
@@ -988,7 +1046,7 @@ class Mouth:
                     # hits are noise, but a dense SUSTAINED run of these
                     # is still the real signature a serious recurrence
                     # (e.g. the Boom3D driver issue) would leave behind.
-                    if out.write(pcm[i:i + block]):
+                    if starved:
                         self._consecutive_underflows += 1
                         log_debug("[mouth] output underflow — audio buffer starved")
 
