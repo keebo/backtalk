@@ -47,6 +47,16 @@ import re
 # needs adding once here.
 _CIPHER_MISHEARINGS = ("cipher", "cypher", "slipher", "stifer", "sniper")
 
+# Phrase-level mishearings: not a garbled single word like the ones
+# above, but a whole different phrase Whisper substitutes for "Cipher,"
+# at the start of an utterance. Kept separate from _CIPHER_MISHEARINGS
+# because that tuple also feeds FORCE_CLOUD_PHRASES/_RESEND_LAST_CUES
+# templates below ("ask {m} directly", "send that to {m}") where
+# "sorry for" wouldn't make sense substituted in. Confirmed live
+# 2026-09-21: "Cipher, the snippet is working now" was transcribed as
+# "Sorry for the snippet is working now" and fell through to Rosa.
+_CIPHER_PHRASE_MISHEARINGS = ("sorry for",)
+
 # Any of these appearing routes to Claude. Substring match, lowercase,
 # deliberately broad — biased toward over-routing to cloud rather than
 # under-routing, since a mistaken cloud turn just costs some tokens
@@ -73,7 +83,7 @@ CLOUD_KEYWORDS = (
     # matched) and Rosa hallucinated a description of the repo from its
     # name alone instead of declining.
     "http", "www.",
-) + _CIPHER_MISHEARINGS
+) + _CIPHER_MISHEARINGS + _CIPHER_PHRASE_MISHEARINGS
 
 # Spoken to force a question to Claude regardless of what the keyword
 # scan would have decided — the explicit override Kevin asked for.
