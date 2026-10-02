@@ -424,6 +424,18 @@ class WarmBrain:
         can say so out loud instead of quietly going stale."""
         self._dirty = True             # in flight until its ResultMessage
         tag = utterance[:40].replace("\n", " ")
+        # Confirmed 2026-10-02: a turn can hit its ResultMessage having
+        # spoken zero sentences — e.g. a background task_notification
+        # riding the one shared message stream and getting mistaken for
+        # this turn's own boundary (see reset_turn's docstring above).
+        # ResultMessage carries no parent_tool_use_id/correlator that
+        # would let this be filtered out precisely, so there's no way
+        # to catch it before the fact. What we CAN fix: never let that
+        # show up to Kevin as total silence — track whether anything
+        # was actually yielded, and if not, say so instead of going
+        # quiet. No auto-retry: the turn may have already run a real
+        # tool call with side effects, so re-issuing it blind isn't safe.
+        yielded_any = False
         try:
             await self._client.query(utterance)
             log_debug(f"[brain] >> {tag!r}")
@@ -469,6 +481,7 @@ class WarmBrain:
                                 sentence, buf = (buf[:m.end()].strip(),
                                                  buf[m.end():])
                                 if sentence:
+                                    yielded_any = True
                                     yield sentence
                     elif ev.get("type") == "content_block_stop":
                         # End of a speech block (e.g. right before a tool
@@ -480,6 +493,7 @@ class WarmBrain:
                         tail = buf.strip()
                         buf = ""
                         if tail:
+                            yielded_any = True
                             yield tail
                 elif t == "ResultMessage":
                     self._dirty = False    # turn fully consumed — pipe aligned
@@ -490,7 +504,14 @@ class WarmBrain:
                     break
             tail = buf.strip()
             if tail:
+                yielded_any = True
                 yield tail
+            if not yielded_any:
+                log(f"[brain] {tag!r} ended with zero spoken output — "
+                    f"likely a mispaired stream boundary, surfacing instead "
+                    f"of going silent")
+                yield ("Sorry, I think that got lost somewhere — "
+                       "can you ask that again?")
         except asyncio.CancelledError:
             raise    # a normal interrupt — reset_turn handles this path
         except Exception as e:
@@ -498,6 +519,63 @@ class WarmBrain:
                 f"rebuilding")
             await self._rebuild_client()
             raise BrainDisconnected(str(e)) from e
+
+    async def drain_pending(self, peek_timeout: float = 0.5):
+        """Opportunistic idle-time check: is there real content sitting
+        unconsumed on the shared stream with nobody reading it?
+
+        Confirmed 2026-10-02: autonomous content (e.g. a reply generated
+        off a background task_notification, with no active ask_stream()
+        call in flight to catch it) can sit on the one shared stream
+        completely unheard until the next real query's reset_turn()
+        drains it as stale leftovers — by then it's too late to speak,
+        only to discard. This is the fix: call this periodically while
+        genuinely idle (never while a real turn is active — that
+        stream is ask_stream's to read in that window, not this one's).
+        Does NOT send a query; only checks what's already arrived.
+        Yields real sentences as it finds them, same sentence-splitting
+        as ask_stream. The common case is nothing's there — this
+        returns having yielded nothing, cheaply, within peek_timeout."""
+        if not self._client:
+            return
+        buf = ""
+        try:
+            agen = self._client.receive_response()
+            while True:
+                try:
+                    msg = await asyncio.wait_for(agen.__anext__(), peek_timeout)
+                except (asyncio.TimeoutError, StopAsyncIteration):
+                    break
+                t = type(msg).__name__
+                if t == "StreamEvent":
+                    ev = getattr(msg, "event", {}) or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta", {}) or {}
+                        if delta.get("type") == "text_delta":
+                            buf += delta.get("text", "")
+                            while True:
+                                m = _SENTENCE_END.search(buf)
+                                if not m:
+                                    break
+                                sentence, buf = (buf[:m.end()].strip(),
+                                                 buf[m.end():])
+                                if sentence:
+                                    yield sentence
+                    elif ev.get("type") == "content_block_stop":
+                        tail = buf.strip()
+                        buf = ""
+                        if tail:
+                            yield tail
+                elif t == "ResultMessage":
+                    self._tally(msg, count_turn=False)
+                    self._remember_session(msg)
+                    self._dirty = False
+                    break
+            tail = buf.strip()
+            if tail:
+                yield tail
+        except Exception as e:
+            log_debug(f"[brain] idle drain_pending failed: {e}")
 
 
 if __name__ == "__main__":

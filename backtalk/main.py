@@ -1246,6 +1246,35 @@ async def amain():
     # state ask_stream set on the face for a question Kevin never asked.
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
     signals.set_state("idle")
+
+    _IDLE_DRAIN_INTERVAL_S = 4.0
+
+    async def _idle_drain_loop():
+        """Safety net confirmed necessary 2026-10-02: a reply generated
+        off a background task_notification, with no active ask_stream()
+        call listening for it, used to sit unheard until the next real
+        question's drain swept it up as discarded leftovers. Only runs
+        while genuinely idle -- a real turn in flight owns the stream,
+        this leaves it alone entirely while one is active."""
+        while True:
+            await asyncio.sleep(_IDLE_DRAIN_INTERVAL_S)
+            if signals.turn_active() or mouth.speaking:
+                continue
+            try:
+                async for sentence in brain.drain_pending():
+                    s = " ".join(_DIRECTION_TAG.sub(" ", sentence)
+                                  .replace("`", "").split()).strip()
+                    if not s:
+                        continue
+                    signals.transcript(NAME, s)
+                    log(f"[{NAME}] (idle-drain) {s}")
+                    mouth.say_chunk(s)
+            except Exception as e:
+                log(f"[backtalk] idle-drain failed: {e}")
+
+    # Reference kept alive in amain()'s own frame, same reason as
+    # _warmup_task above -- asyncio only holds a weak reference otherwise.
+    _idle_drain_task = asyncio.create_task(_idle_drain_loop())
     # a configured effort level applies at launch (saved by the spoken
     # "set effort to X", or written by the person's agent on request)
     boot_effort = str(CFG.get("effort") or "").strip().lower()

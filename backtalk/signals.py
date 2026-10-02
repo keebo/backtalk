@@ -49,8 +49,10 @@ Every write is wrapped: the bus must never crash the voice line.
 """
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -133,13 +135,55 @@ def set_state(name: str):
             pass
 
 
+# feed_waveform() is called from mouth.py's hot audio-write loop, in
+# between successive out.write(pcm) calls to the speaker — ~15x/sec while
+# speaking. It used to write its files inline on that same thread; under
+# any real system load, that blocking disk write could itself take long
+# enough to delay the next audio write past PortAudio's buffer deadline,
+# causing a real underflow (confirmed 2026-10-02, after a comment here
+# since 2026-09-01 already suspected exactly this). Fix: do the actual
+# file I/O on a dedicated background thread instead, fed by a
+# maxsize=1 "latest wins" queue — staleness-tolerant, since this is a
+# best-effort visualization signal, not something correctness depends
+# on. The hot path now only does cheap in-memory numpy work before
+# handing off.
+_waveform_queue: "queue.Queue" = queue.Queue(maxsize=1)
+_waveform_thread_started = False
+
+
+def _waveform_writer_loop():
+    while True:
+        now, raw = _waveform_queue.get()
+        try:
+            with open(_WAVEFORM_FILE, "w") as f:
+                f.write(json.dumps({"ts": now, "samples": raw.tolist()}))
+            if _BH_WAVE:
+                norm = np.clip(np.abs(raw) / 32768.0, 0.0, 1.0)
+                with open(_BH_WAVE, "w") as f:
+                    f.write(json.dumps({"ts": now, "samples": norm.tolist()}))
+        except (OSError, ValueError):
+            pass
+        set_state("speaking")
+
+
+def _ensure_waveform_thread():
+    global _waveform_thread_started
+    if not _waveform_thread_started:
+        _waveform_thread_started = True
+        threading.Thread(target=_waveform_writer_loop, daemon=True).start()
+
+
 def feed_waveform(pcm: np.ndarray):
     """Feed one PCM block (int16) — throttled, downsampled to 64 points.
 
     Also re-asserts state="speaking" on the same throttle: this only runs
     while the mouth is audibly playing, so the bus self-heals within
     ~70ms if a stray writer stomps the state mid-speech. (That self-heal
-    rule once closed a bug that took a whole evening to find.)"""
+    rule once closed a bug that took a whole evening to find.)
+
+    The actual disk writes happen off-thread — see _waveform_writer_loop.
+    This function must stay cheap and non-blocking; it runs on the same
+    thread as the live audio write()."""
     global _last_waveform_write
     if pcm.size == 0:
         return
@@ -147,18 +191,13 @@ def feed_waveform(pcm: np.ndarray):
     if now - _last_waveform_write < _WAVEFORM_MIN_INTERVAL:
         return
     _last_waveform_write = now
+    idx = np.linspace(0, pcm.size - 1, 64).astype(int)
+    raw = pcm[idx].astype(float)
+    _ensure_waveform_thread()
     try:
-        idx = np.linspace(0, pcm.size - 1, 64).astype(int)
-        raw = pcm[idx].astype(float)
-        with open(_WAVEFORM_FILE, "w") as f:
-            f.write(json.dumps({"ts": now, "samples": raw.tolist()}))
-        if _BH_WAVE:
-            norm = np.clip(np.abs(raw) / 32768.0, 0.0, 1.0)
-            with open(_BH_WAVE, "w") as f:
-                f.write(json.dumps({"ts": now, "samples": norm.tolist()}))
-    except (OSError, ValueError):
-        pass
-    set_state("speaking")
+        _waveform_queue.put_nowait((now, raw))
+    except queue.Full:
+        pass  # a fresher frame is already queued — this one's stale anyway
 
 
 def set_source(name: str):
