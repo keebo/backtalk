@@ -82,8 +82,8 @@ import transformers  # noqa: F401
 from backtalk import router, signals
 from backtalk.brain import BrainDisconnected, WarmBrain
 from backtalk.config import CFG
-from backtalk.ears import (Ears, explain_audio_failure, record_held,
-                           warm as warm_ears)
+from backtalk.ears import (Ears, PTTCapture, explain_audio_failure,
+                           record_held, warm as warm_ears)
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
@@ -1225,9 +1225,26 @@ async def amain():
         await asyncio.wait_for(brain.start(), 120)
 
         async def _warmup():
-            async for _ in brain.ask_stream(
+            raw_chunks: list[str] = []
+            async for chunk in brain.ask_stream(
                     "Warmup ping - reply with the single word: ready"):
-                pass
+                raw_chunks.append(chunk)
+            reply = _DIRECTION_TAG.sub(" ", "".join(raw_chunks))
+            reply = " ".join(reply.replace("`", "").split()).strip()
+            # A resumed session (restart mid-conversation) can treat this
+            # hidden plumbing ping as a cue to finish a real, still-pending
+            # answer instead of just saying "ready" -- confirmed live
+            # 2026-10-18, when a genuine troubleshooting reply was
+            # generated here and silently discarded, never reaching Kevin
+            # as speech or in the transcript. A short, ready-shaped reply
+            # is still thrown away as pure plumbing; anything longer is a
+            # real answer that has to get through.
+            is_trivial = len(reply) <= 10 and "ready" in reply.lower()
+            if reply and not is_trivial:
+                log("[backtalk] warmup ping got a real reply, not just "
+                    "'ready' -- speaking it instead of discarding it")
+                signals.transcript(NAME, reply)
+                mouth.say(reply)
         await asyncio.wait_for(_warmup(), 180)
     except (Exception, asyncio.TimeoutError) as e:
         kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
@@ -1647,6 +1664,21 @@ async def amain():
                     # just does nothing while silent.
                     log("[ptt] press ignored — silent mode is on")
                     continue
+                # Opened HERE, first, before any of the interrupt/ducking
+                # handling below -- root-caused 2026-10-11: that handling
+                # (mouth.shut_up(), static_stop(), ducker.speech_start())
+                # used to run BEFORE record_held() ever opened the mic,
+                # and that gap -- plus the mic's own open latency on top
+                # of it -- was silently eating the first word of every
+                # utterance, "Cipher" included. Starting capture on this
+                # line means everything said from now on is actually
+                # recorded, not just whatever's left after the handling
+                # below finishes.
+                try:
+                    capture = PTTCapture()
+                except Exception as e:
+                    capture = None
+                    log(f"[ears] could not open mic on press: {e!r}")
                 press_t = time.monotonic()
                 perm_wait = (_PERM["fut"] is not None
                              and not _PERM["fut"].done())
@@ -1663,7 +1695,8 @@ async def amain():
                 _MIC["btn"] = True               # open mic yields to the button
                 try:
                     text = await loop.run_in_executor(
-                        None, lambda: record_held(ptt.is_held))
+                        None, lambda: record_held(ptt.is_held,
+                                                   capture=capture))
                 except Exception as e:
                     # A device-level failure gets plain words instead of a
                     # raw exception. The pre-flight at startup cannot catch

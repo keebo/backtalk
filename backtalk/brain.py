@@ -436,6 +436,7 @@ class WarmBrain:
         # quiet. No auto-retry: the turn may have already run a real
         # tool call with side effects, so re-issuing it blind isn't safe.
         yielded_any = False
+        _last_assistant_text = ""
         try:
             await self._client.query(utterance)
             log_debug(f"[brain] >> {tag!r}")
@@ -452,6 +453,21 @@ class WarmBrain:
                 # utterance's stream, that's the smoking gun.
                 if t not in ("StreamEvent", "ResultMessage"):
                     log_debug(f"[brain] .. {tag!r} recv {_msg_tag(msg)}")
+                if t == "AssistantMessage":
+                    # Diagnostic (2026-10-18): capture any text in the full
+                    # AssistantMessage. Instant error replies (login, usage
+                    # limit, prompt too long) arrive here with no StreamEvents.
+                    try:
+                        for _b in (getattr(msg, "content", None) or []):
+                            _tx = getattr(_b, "text", None)
+                            if _tx:
+                                _last_assistant_text = _tx
+                                log(f"[brain] {tag!r} assistant text: {_tx[:300]!r}")
+                        _err = getattr(msg, "error", None)
+                        if _err:
+                            log(f"[brain] {tag!r} assistant error: {_err!r}")
+                    except Exception:
+                        pass
                 if t == "StreamEvent":
                     ev = getattr(msg, "event", {}) or {}
                     if ev.get("type") == "content_block_start":
@@ -496,6 +512,13 @@ class WarmBrain:
                             yielded_any = True
                             yield tail
                 elif t == "ResultMessage":
+                    try:
+                        log(f"[brain] {tag!r} result subtype="
+                            f"{getattr(msg, 'subtype', None)!r} is_error="
+                            f"{getattr(msg, 'is_error', None)!r} result="
+                            f"{str(getattr(msg, 'result', ''))[:300]!r}")
+                    except Exception:
+                        pass
                     self._dirty = False    # turn fully consumed — pipe aligned
                     self._tally(msg)
                     self._remember_session(msg)
@@ -510,8 +533,12 @@ class WarmBrain:
                 log(f"[brain] {tag!r} ended with zero spoken output — "
                     f"likely a mispaired stream boundary, surfacing instead "
                     f"of going silent")
-                yield ("Sorry, I think that got lost somewhere — "
-                       "can you ask that again?")
+                if _last_assistant_text:
+                    # Speak what Claude Code actually said (often an error)
+                    yield _last_assistant_text
+                else:
+                    yield ("Sorry, I think that got lost somewhere — "
+                           "can you ask that again?")
         except asyncio.CancelledError:
             raise    # a normal interrupt — reset_turn handles this path
         except Exception as e:

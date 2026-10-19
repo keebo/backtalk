@@ -850,6 +850,15 @@ class Mouth:
         since it's the queue actually draining that matters, not which
         path got each item there."""
         if self._q.empty():
+            # Confirmed 2026-10-02: feed_waveform()'s disk writes moved to
+            # a background thread earlier tonight (the underflow fix) so
+            # they'd never again delay live audio -- but that decoupled
+            # them from this exact moment too. The LAST queued waveform
+            # write can now land a few ms AFTER this declares idle,
+            # stomping it back to "speaking" with nothing left to ever
+            # correct it again. Give that straggler a moment to land
+            # FIRST, so idle is provably the last write, not a race.
+            time.sleep(0.15)
             self._speaking.clear()
             self.ducker.speech_end()
             # Only declare idle if the brain agrees the turn is

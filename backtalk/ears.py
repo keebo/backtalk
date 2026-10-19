@@ -25,10 +25,14 @@ an utterance opens after ~120ms of sustained speech, closes after
 `silence_ms` of trailing quiet. A `gate` callable can suppress
 listening (so the open mic ignores the speakers unless barge-in is on).
 """
+import glob
+import os
 import platform
 import re
 import sys
 import threading
+import time
+import wave
 
 import numpy as np
 import sounddevice as sd
@@ -417,22 +421,168 @@ class Ears:
                         return transcribe(np.concatenate(frames))
 
 
-def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
+class PTTCapture:
+    """Opens the mic and starts buffering audio immediately on
+    construction — well before record_held() below is actually called.
+
+    Root-caused 2026-10-11: record_held() used to open the mic itself,
+    which meant capture only began after main.py finished its
+    interrupt-handling for the press (mouth.shut_up(), static_stop(),
+    ducker.speech_start()...). That gap, stacked on top of the
+    InputStream's own open latency, was silently eating the first word
+    of every utterance — "Cipher" included, which is why it kept
+    reading as a miss to the router rather than a mishearing. Creating
+    this object is now the very first thing main.py does on a press,
+    before any of that other handling, so the stream is open and the
+    reader thread is already running while that other work happens
+    instead of after it.
+
+    Deliberately NOT a stream left open across presses — ptt.py's mic
+    stays closed between holds on purpose (speaker-safety, see its
+    module docstring); this just moves the open to the earliest
+    possible instant for one press, not to the whole session.
+
+    DIAGNOSTIC INSTRUMENTATION, added 2026-10-12: the fix above didn't
+    actually stop the clipping — Kevin caught "Cipher, it's done" and a
+    bare "It's done." ten seconds apart in the same live session, same
+    intended phrase, one missing the wake word entirely. Rather than
+    guess at a second fix blind (the first one was confirmed only by
+    "no crash in the log," never by an actual word-level test — exactly
+    how this got missed), this class now times exactly when real speech
+    is first detected relative to when the mic opened, and saves the
+    raw audio to disk, so the NEXT occurrence can be inspected directly
+    instead of theorized about. Not a fix by itself.
+    """
+
+    DEBUG_DIR = "/tmp/ptt_debug"
+    DEBUG_KEEP = 20
+
+    def __init__(self):
+        self._frames: list[np.ndarray] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._t_open = time.monotonic()
+        self._t_first_frame = None
+        self._t_first_speech = None
+        self._frame_count = 0
+        self._vad = webrtcvad.Vad(2)
+        self._stream = _open_mic()
+        self._stream.start()
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self):
+        while not self._stop.is_set():
+            try:
+                block, _ = self._stream.read(FRAME_LEN)
+            except Exception:
+                return
+            now = time.monotonic()
+            mono = block[:, 0].copy()
+            with self._lock:
+                self._frames.append(mono)
+                self._frame_count += 1
+                if self._t_first_frame is None:
+                    self._t_first_frame = now
+                if self._t_first_speech is None:
+                    try:
+                        is_speech = self._vad.is_speech(mono.tobytes(), RATE)
+                    except Exception:
+                        is_speech = False
+                    if is_speech:
+                        self._t_first_speech = now
+
+    def _save_debug_wav(self, pcm: np.ndarray) -> str | None:
+        """Keeps the last DEBUG_KEEP raw recordings on disk (tiny —
+        a few seconds of 16kHz mono is well under 100KB each) so a
+        failing utterance can be listened to/re-transcribed after the
+        fact instead of guessed at from log text alone."""
+        try:
+            os.makedirs(self.DEBUG_DIR, exist_ok=True)
+            path = os.path.join(self.DEBUG_DIR, f"ptt_{int(time.time() * 1000)}.wav")
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(RATE)
+                wf.writeframes(pcm.tobytes())
+            existing = sorted(glob.glob(os.path.join(self.DEBUG_DIR, "ptt_*.wav")))
+            for stale in existing[:-self.DEBUG_KEEP]:
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+            return path
+        except Exception as e:
+            log(f"[ptt-diag] could not save debug wav: {e!r}")
+            return None
+
+    def finish(self, tail_frames: int = 6) -> tuple[np.ndarray, dict]:
+        """Call once is_held() has gone False. Lets the reader thread
+        keep going a beat longer first (same purpose as record_held's
+        old post-loop tail read: the last word shouldn't clip at
+        release either), then stops and closes the stream.
+
+        Returns (pcm, diagnostics) — diagnostics has the open->first-frame
+        and open->first-speech latencies (ms), total frame count, and the
+        saved debug wav path, for record_held to log alongside the final
+        transcript."""
+        time.sleep(tail_frames * FRAME_MS / 1000)
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:
+            pass
+        with self._lock:
+            frames = self._frames
+            t_first_frame, t_first_speech, frame_count = \
+                self._t_first_frame, self._t_first_speech, self._frame_count
+        pcm = np.concatenate(frames) if frames else np.zeros(0, dtype=np.int16)
+        diag = {
+            "open_to_first_frame_ms":
+                round((t_first_frame - self._t_open) * 1000, 1)
+                if t_first_frame else None,
+            "open_to_first_speech_ms":
+                round((t_first_speech - self._t_open) * 1000, 1)
+                if t_first_speech else None,
+            "frame_count": frame_count,
+            "duration_s": round(frame_count * FRAME_MS / 1000, 2),
+            "debug_wav": self._save_debug_wav(pcm) if len(pcm) else None,
+        }
+        return pcm, diag
+
+
+def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25,
+                capture: "PTTCapture | None" = None) -> str | None:
     """Hold-to-talk capture: record raw audio while is_held() is True,
     then transcribe. The button is the VAD — no endpointing. Returns
-    None for taps shorter than min_s (accidental presses)."""
-    frames: list[np.ndarray] = []
-    with _open_mic() as stream:
-        while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
-            block, _ = stream.read(FRAME_LEN)
-            frames.append(block[:, 0].copy())
-        # a small tail so the last word isn't clipped at release
-        for _ in range(6):
-            block, _ = stream.read(FRAME_LEN)
-            frames.append(block[:, 0].copy())
-    if len(frames) * FRAME_MS / 1000 < min_s:
+    None for taps shorter than min_s (accidental presses).
+
+    `capture`, if given, is a PTTCapture already opened and reading —
+    see its docstring for why main.py creates one before this function
+    is even called. Falls back to opening its own here when not given,
+    so this stays callable standalone (e.g. the __main__ block below)."""
+    if capture is None:
+        capture = PTTCapture()
+    try:
+        start = time.monotonic()
+        while is_held() and time.monotonic() - start < max_s:
+            time.sleep(FRAME_MS / 1000)
+    finally:
+        # finish() must run even if is_held() blows up mid-loop, same
+        # guarantee the old `with _open_mic() as stream:` gave for free —
+        # otherwise the reader thread and stream are left open forever.
+        pcm, diag = capture.finish()
+    if len(pcm) / RATE < min_s:
+        log(f"[ptt-diag] {diag} text=(tap too short, discarded)")
         return None
-    return transcribe(np.concatenate(frames))
+    text = transcribe(pcm)
+    # Logged every press, not just failures -- a working case right next
+    # to a dropped-word case in the same log is what actually isolates
+    # whether this is a capture-timing problem or a transcription one.
+    log(f"[ptt-diag] {diag} text={text!r}")
+    return text
 
 
 if __name__ == "__main__":
