@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 logs/
+*.bak-*
 # the signal bus, written at runtime. A GLOB and not a list: the list named
 # three files while the code wrote five, so .voice_reply_done and
 # .voice_direction left every user's repo permanently dirty after their first
